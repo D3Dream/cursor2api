@@ -1,5 +1,8 @@
 # cursor2api
 
+> 主要面向 VPS Docker 内网部署，可接入 `sub2api` 等 AI 中转服务，作为
+> Cursor Agent 的内部上游。默认不将服务端口直接暴露到公网。
+
 cursor2api 把 Cursor Agent 的私有 Connect-RPC 协议转换成常见 AI API：
 
 - Anthropic Messages：`/v1/messages`
@@ -12,9 +15,11 @@ cursor2api 把 Cursor Agent 的私有 Connect-RPC 协议转换成常见 AI API�
 
 1. 先在本机运行 `cursor2api.exe`，确认 token、模型和工具循环都正常。
 2. 再交叉编译 Linux amd64 二进制。
-3. 上传到 Ubuntu VPS，用二进制或 Docker 运行。
+3. 上传到 Ubuntu VPS，优先用 Docker 运行。
 4. 将 cursor2api 加入 sub2api 的 Docker 网络。
 5. 在 sub2api 中配置为内部上游。
+
+直接运行 Linux 二进制也可以，详见第 4 节；Docker 部署详见第 5 节。
 
 ```text
 Claude Code / Codex
@@ -214,7 +219,24 @@ set +a
 
 如果 VPS 上安装了 Docker，推荐使用预编译二进制组装运行时镜像。这样 VPS 不需要安装 Go，也不会重新编译。
 
-### 5.1 准备上传目录
+### 5.1 首次部署
+
+首次部署需要准备以下文件：
+
+```text
+cursor2api
+schema/cursor_fds.json
+Dockerfile.prebuilt
+docker-compose.yml
+config.docker.json
+.env.cursor2api
+```
+
+可以直接使用发布包中的 `docker-compose.cursor2api.prebuilt.yml`，也可以继续使用已经接入
+sub2api 网络的自定义 Compose 文件。`config.docker.json` 和 `.env.cursor2api` 需要填写真实配置，
+不要把真实密钥提交到 Git 仓库。
+
+### 5.2 准备上传目录
 
 在 Windows PowerShell：
 
@@ -234,7 +256,7 @@ Copy-Item .\config.docker.example.json deploy\config.docker.json
 scp -r .\deploy root@你的VPS:/opt/cursor2api
 ```
 
-### 5.2 VPS 配置
+### 5.3 VPS 配置
 
 ```bash
 cd /opt/cursor2api
@@ -266,7 +288,7 @@ EOF
 chmod 600 .env.cursor2api
 ```
 
-### 5.3 组装镜像并启动
+### 5.4 组装镜像并启动
 
 ```bash
 docker build -f Dockerfile.prebuilt -t cursor2api:linux-amd64 .
@@ -280,6 +302,30 @@ docker compose logs -f cursor2api
 ```
 
 当前 Compose 示例使用 `expose`，不是 `ports`，因此 3010 不会暴露到宿主机公网。
+
+### 5.5 更新版本
+
+更新时不需要重新配置，也不要覆盖已经改好的 Compose 网络配置。保留以下文件：
+
+```text
+config.docker.json
+.env.cursor2api
+docker-compose.yml
+```
+
+将新发布包中的 `cursor2api` 和 `schema/cursor_fds.json` 替换到部署目录，然后重新构建镜像并重建容器：
+
+```bash
+cd /opt/cursor2api
+chmod +x cursor2api
+
+docker build -f Dockerfile.prebuilt -t cursor2api:linux-amd64 .
+docker compose up -d --force-recreate --no-build
+docker compose logs -f --tail=100 cursor2api
+```
+
+构建镜像时旧容器可以继续运行，不需要先 `docker compose down`。`--force-recreate` 会让容器使用新镜像，
+配置文件和 Cursor token 仍从原来的挂载与环境文件读取。
 
 ## 6. 让不同 Docker Compose 项目加入同一个网络
 
