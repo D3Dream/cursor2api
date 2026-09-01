@@ -469,29 +469,7 @@ x-api-key: <apiKey>
 | `requestTimeoutMs` | `300000` | 单次请求超时 |
 | `modelMap` | `{}` | 请求模型到 Cursor 模型映射 |
 
-## 11. 打包 Release
-
-不建议把二进制提交进 Git。建议发布 GitHub Release Asset。
-
-```powershell
-$Version = "v0.1.0"
-$Pkg = "cursor2api_${Version}_linux_amd64"
-
-New-Item -ItemType Directory -Force ".\dist\$Pkg\schema" | Out-Null
-
-Copy-Item .\dist\cursor2api ".\dist\$Pkg\cursor2api"
-Copy-Item .\schema\cursor_fds.json ".\dist\$Pkg\schema\"
-Copy-Item .\config.docker.example.json ".\dist\$Pkg\"
-Copy-Item .\Dockerfile.prebuilt ".\dist\$Pkg\"
-Copy-Item .\docker-compose.cursor2api.prebuilt.yml ".\dist\$Pkg\docker-compose.yml"
-
-tar -czf ".\dist\$Pkg.tar.gz" -C ".\dist" $Pkg
-Get-FileHash ".\dist\$Pkg.tar.gz" -Algorithm SHA256
-```
-
-上传 `tar.gz` 到 GitHub Release，并在说明中附 SHA256。
-
-## 12. 安全注意事项
+## 11. 安全注意事项
 
 - 使用强 API key。
 - 不要提交 `config.json`、`config.docker.json`、`.env*` 或 Cursor token。
