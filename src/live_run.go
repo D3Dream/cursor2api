@@ -68,6 +68,15 @@ func (l *liveRun) updatePending(pending []PendingTool) {
 	l.mu.Unlock()
 }
 
+func (l *liveRun) pendingTools() []PendingTool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil
+	}
+	return append([]PendingTool(nil), l.pending...)
+}
+
 func (l *liveRun) currentRun() *cursor.Run {
 	l.mu.Lock()
 	defer l.mu.Unlock()

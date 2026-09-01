@@ -100,6 +100,34 @@ func (s *ConversationStore) FindByRespHash(hash string) *Conversation {
 	return c
 }
 
+// FindByPendingToolID resolves the exact conversation state that emitted a
+// tool_use. Tool IDs survive client-side streaming/text normalization, making
+// them a stronger continuation anchor than the full assistant fingerprint.
+func (s *ConversationStore) FindByPendingToolID(namespace, toolID string) *Conversation {
+	if toolID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purge()
+	prefix := namespace + ":"
+	var found *Conversation
+	for _, c := range s.byHash {
+		if !strings.HasPrefix(c.LastRespHash, prefix) {
+			continue
+		}
+		for _, pending := range c.PendingTools {
+			if pending.ToolUseID == toolID && (found == nil || c.LastUsed.After(found.LastUsed)) {
+				found = c
+			}
+		}
+	}
+	if found != nil {
+		found.LastUsed = s.nextStamp()
+	}
+	return found
+}
+
 // maxConversations 会话存储上限：每个会话携带 Checkpoint（含 blobs，
 // 单 run 上限 256MB），只按 TTL 清理会被大量会话撑爆内存。
 // 超限按 LastUsed 淘汰最久未用（LRU）。

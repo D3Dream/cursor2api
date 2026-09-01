@@ -537,7 +537,13 @@ func (r *Run) RespondExec(execName, argsJSON string, execID uint32, execIDStr, r
 			setStrIf(ok, "path", argPath)
 		}
 	}
-	return r.send(acm)
+	if err := r.send(acm); err != nil {
+		return err
+	}
+	// Cursor's native exec protocol is two-part: the typed result carries the
+	// payload, while stream_close marks that exec ID as complete. Without the
+	// close frame the upstream accepts read_result but keeps waiting forever.
+	return r.sendStreamClose(execID)
 }
 
 func jsonArgString(raw, key string) string {
@@ -649,8 +655,7 @@ func (r *Run) respondShellStream(execID uint32, resultText string, isError bool)
 	}); err != nil {
 		return err
 	}
-	r.sendStreamClose(execID)
-	return nil
+	return r.sendStreamClose(execID)
 }
 
 // Close 终止运行。
@@ -903,6 +908,7 @@ func (r *Run) handleExec(esm *dynamicpb.Message) {
 		}
 		name := string(fd.Name())
 		args := esm.Get(fd).Message().(*dynamicpb.Message)
+		dlog("exec dispatch id=%d name=%s", execID, name)
 		switch name {
 		case "request_context_args":
 			r.replyRequestContext(execID, execIDStr)
@@ -992,6 +998,10 @@ func downstreamToolArgs(execName string, args *dynamicpb.Message) string {
 		obj["content"] = v
 		delete(obj, "file_text")
 	}
+	// Cursor uses this only to correlate its native exec internally. The proxy
+	// keeps ExecID/ExecIDStr separately; exposing it makes strict downstream
+	// Read/Write tool schemas reject otherwise valid calls.
+	delete(obj, "tool_call_id")
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return string(b)
@@ -1085,7 +1095,7 @@ func (r *Run) replyRequestContext(execID uint32, execIDStr string) {
 		}
 	}
 	_ = r.send(acm)
-	r.sendStreamClose(0)
+	_ = r.sendStreamClose(0)
 }
 
 // replyExecRejected 拒绝不支持的 exec 类型。
@@ -1298,19 +1308,19 @@ func (r *Run) execShellStream(execID uint32, execIDStr string, args *dynamicpb.M
 	})
 
 	// exec 完成信号（CLI 实测：streamClose 带 exec id 才会被服务端确认完成）
-	r.sendStreamClose(execID)
+	_ = r.sendStreamClose(execID)
 }
 
 // sendStreamClose 发送 exec 关闭信号（id=0 表示无 id，用于 request_context 等无 id exec）。
-func (r *Run) sendStreamClose(id uint32) {
+func (r *Run) sendStreamClose(id uint32) error {
 	acm, err := r.reg.New("agent.v1.AgentClientMessage")
 	if err != nil {
-		return
+		return err
 	}
 	ctrl := sub(acm, "exec_client_control_message")
 	sc := sub(ctrl, "stream_close")
 	if id > 0 {
 		setUint(sc, "id", id)
 	}
-	_ = r.send(acm)
+	return r.send(acm)
 }

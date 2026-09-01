@@ -180,6 +180,21 @@ func (s *Server) planRun(req *anthropicRequest, model string) (cursor.RunOptions
 			continue
 		}
 		blocks := parseContent(req.Messages[i].Content)
+		// Tool IDs are exact protocol identities. Prefer them over the full
+		// assistant fingerprint, whose text can be normalized by streaming
+		// clients and otherwise make us fall back to an older pending tool.
+		for _, b := range blocks {
+			if b.Type == "tool_use" && b.ID != "" {
+				if c := s.conversations.FindByPendingToolID(ns, b.ID); c != nil {
+					conv = c
+					lastIdx = i
+					break
+				}
+			}
+		}
+		if conv != nil {
+			break
+		}
 		if c := s.conversations.FindByRespHash(ns + ":" + hashBlocks(blocks)); c != nil {
 			conv = c
 			lastIdx = i
@@ -260,6 +275,13 @@ func (s *Server) planRun(req *anthropicRequest, model string) (cursor.RunOptions
 				}
 			}
 			if !matched {
+				if debug {
+					pendingIDs := make([]string, 0, len(conv.PendingTools))
+					for _, pt := range conv.PendingTools {
+						pendingIDs = append(pendingIDs, pt.ToolUseID+":"+pt.Name)
+					}
+					dlog("planRun: unmatched tool_result id=%q pending=%v", b.ToolUseID, pendingIDs)
+				}
 				// 找不到对应挂起调用：作为文本附带（模型可见）
 				textParts = append(textParts, fmt.Sprintf("[tool result %s]: %s", b.ToolUseID, toolResultText(b.Content)))
 			}
@@ -304,6 +326,75 @@ type anthropicResponse struct {
 	StopReason   string         `json:"stop_reason"`
 	StopSequence any            `json:"stop_sequence"`
 	Usage        anthropicUsage `json:"usage"`
+}
+
+// replayAnthropicPending returns the same tool_use blocks while a downstream
+// client is still waiting for permission and has not produced tool_result yet.
+// The live Cursor stream remains paused and is resumed only by a later request
+// carrying the results.
+func replayAnthropicPending(w http.ResponseWriter, req *anthropicRequest, pending []PendingTool) {
+	content := make([]contentBlock, 0, len(pending))
+	for _, p := range pending {
+		content = append(content, contentBlock{
+			Type: "tool_use", ID: p.ToolUseID, Name: p.Name, Input: json.RawMessage(p.Input),
+		})
+	}
+	if !req.Stream {
+		_ = writeJSON(w, http.StatusOK, anthropicResponse{
+			ID: newMessageID(), Type: "message", Role: "assistant", Content: content,
+			Model: req.Model, StopReason: "tool_use", Usage: anthropicUsage{},
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, _ := w.(http.Flusher)
+	send := func(event string, payload any) bool {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return false
+		}
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data); err != nil {
+			return false
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return true
+	}
+	msgID := newMessageID()
+	if !send("message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": msgID, "type": "message", "role": "assistant", "content": []any{},
+			"model": req.Model, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
+		},
+	}) {
+		return
+	}
+	for i, p := range pending {
+		if !send("content_block_start", map[string]any{
+			"type": "content_block_start", "index": i,
+			"content_block": map[string]any{
+				"type": "tool_use", "id": p.ToolUseID, "name": p.Name, "input": map[string]any{},
+			},
+		}) || !send("content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": i,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": p.Input},
+		}) || !send("content_block_stop", map[string]any{"type": "content_block_stop", "index": i}) {
+			return
+		}
+	}
+	if !send("message_delta", map[string]any{
+		"type": "message_delta", "delta": map[string]any{"stop_reason": "tool_use", "stop_sequence": nil},
+		"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
+	}) {
+		return
+	}
+	send("message_stop", map[string]any{"type": "message_stop"})
 }
 
 // turnResult 一次 run 的收集结果。
@@ -352,6 +443,8 @@ func errEmptyTurn(model string) error {
 // errClientWrite 客户端连接写入失败（断连）。
 // 必须置 err：否则上层会把半截响应当成功结果存入会话指纹，污染会话链。
 var errClientWrite = errors.New("cursor: client write failed (disconnected)")
+
+const toolCallCollectionWindow = 1500 * time.Millisecond
 
 // matchReplay 判断服务端发来的工具调用是否为挂起调用的重放。
 // 在 results[startIdx:] 里搜（剥 cc 前缀、忽略大小写）。
@@ -465,7 +558,7 @@ func (s *Server) runTurn(ctx context.Context, run *cursor.Run, results []pending
 			}
 			// 收集并行工具调用：短暂等待更多事件
 			shortIdle = true
-			resetIdle(1500 * time.Millisecond)
+			resetIdle(toolCallCollectionWindow)
 		case cursor.EventTurnEnd:
 			shortIdle = false
 			sawTurnEnd = true
@@ -473,9 +566,16 @@ func (s *Server) runTurn(ctx context.Context, run *cursor.Run, results []pending
 			res.usage.InputTokens = ev.Usage.InputTokens
 			res.usage.OutputTokens = ev.Usage.OutputTokens
 		case cursor.EventCheckpoint:
-			shortIdle = false
-			resetIdle(stallTimeout)
 			res.lastCk = ev.Checkpoint
+			// Cursor normally sends a checkpoint immediately after read_args and
+			// other tool calls. Keep the short collection window active so the
+			// tool_use response reaches the downstream agent instead of waiting
+			// for the global 2-minute stall timeout.
+			if shortIdle {
+				resetIdle(toolCallCollectionWindow)
+			} else {
+				resetIdle(stallTimeout)
+			}
 		case cursor.EventError:
 			res.err = ev.Err
 			log.Printf("[anthropic] run error: %v", ev.Err)
@@ -554,7 +654,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "messages is required")
 		return
 	}
-
 	model := s.mapModel(req.Model)
 	if err := s.checkModelUsable(model); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -600,6 +699,16 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if conv != nil {
 		live = liveStore.Get(conv.ID)
 		if live != nil {
+			if len(results) == 0 {
+				pending := live.pendingTools()
+				if len(pending) == 0 {
+					writeAnthropicError(w, http.StatusConflict, "api_error", "live Cursor run has no pending tools")
+					return
+				}
+				dlog("messages: replay %d pending tools while awaiting permission/results", len(pending))
+				replayAnthropicPending(w, &req, pending)
+				return
+			}
 			if err := live.respond(results); err != nil {
 				writeAnthropicError(w, http.StatusConflict, "api_error", err.Error())
 				return

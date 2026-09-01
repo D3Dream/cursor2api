@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -120,6 +121,55 @@ func TestPlanRunMatchesEarlierAssistant(t *testing.T) {
 	}
 	if conv.ID != opts1.ConversationID {
 		t.Fatalf("命中会话 ID = %q, want %q", conv.ID, opts1.ConversationID)
+	}
+}
+
+func TestPlanRunPrefersLatestPendingToolIDOverOlderFingerprint(t *testing.T) {
+	srv := &Server{
+		cfg: Config{CursorMode: "agent"}, conversations: NewConversationStore(time.Minute),
+	}
+	ns := hashText("chain tools")
+	write := PendingTool{ToolUseID: "toolu_write", Name: "Write", Input: `{"file_path":"a"}`}
+	edit := PendingTool{ToolUseID: "toolu_edit", Name: "Edit", Input: `{"file_path":"a","old_string":"x","new_string":"y"}`}
+	srv.conversations.Save(&Conversation{
+		ID: "conv-chain", LastRespHash: ns + ":" + hashBlocks([]contentBlock{{
+			Type: "tool_use", ID: write.ToolUseID, Name: write.Name, Input: json.RawMessage(write.Input),
+		}}), PendingTools: []PendingTool{write},
+	})
+	// The saved text intentionally differs from what the client sends below.
+	// Full-response hashing therefore cannot match the latest Edit state.
+	srv.conversations.Save(&Conversation{
+		ID: "conv-chain", LastRespHash: ns + ":" + hashBlocks([]contentBlock{
+			{Type: "text", Text: "server streamed text"},
+			{Type: "tool_use", ID: edit.ToolUseID, Name: edit.Name, Input: json.RawMessage(edit.Input)},
+		}), PendingTools: []PendingTool{edit},
+	})
+	req := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: "chain tools"},
+		{Role: "assistant", Content: []any{map[string]any{
+			"type": "tool_use", "id": write.ToolUseID, "name": write.Name,
+			"input": map[string]any{"file_path": "a"},
+		}}},
+		{Role: "user", Content: []any{map[string]any{
+			"type": "tool_result", "tool_use_id": write.ToolUseID, "content": "denied", "is_error": true,
+		}}},
+		{Role: "assistant", Content: []any{
+			map[string]any{"type": "text", "text": "client normalized text"},
+			map[string]any{
+				"type": "tool_use", "id": edit.ToolUseID, "name": edit.Name,
+				"input": map[string]any{"file_path": "a", "old_string": "x", "new_string": "y"},
+			},
+		}},
+		{Role: "user", Content: []any{map[string]any{
+			"type": "tool_result", "tool_use_id": edit.ToolUseID, "content": "edited",
+		}}},
+	}}
+	_, results, conv, _ := srv.planRun(req, "default")
+	if conv == nil || conv.PendingTools[0].ToolUseID != edit.ToolUseID {
+		t.Fatalf("matched conversation = %+v, want latest Edit state", conv)
+	}
+	if len(results) != 1 || results[0].Tool.ToolUseID != edit.ToolUseID {
+		t.Fatalf("results = %+v, want Edit result", results)
 	}
 }
 

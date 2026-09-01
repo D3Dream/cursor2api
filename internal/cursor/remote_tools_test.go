@@ -1,11 +1,32 @@
 package cursor
 
 import (
+	"encoding/binary"
+	"io"
 	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/types/dynamicpb"
 )
+
+func readAgentClientMessage(t *testing.T, reg interface {
+	Unmarshal(string, []byte) (*dynamicpb.Message, error)
+}, r io.Reader) *dynamicpb.Message {
+	t.Helper()
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(r, header); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, binary.BigEndian.Uint32(header[1:]))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := reg.Unmarshal("agent.v1.AgentClientMessage", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return msg
+}
 
 func TestHandleExecForwardsBuiltInWithoutLocalExecution(t *testing.T) {
 	reg := testRegistry(t)
@@ -43,6 +64,7 @@ func TestDownstreamToolArgsMapsFilePath(t *testing.T) {
 			t.Fatal(err)
 		}
 		setStr(m, "path", "src/main.go")
+		setStr(m, "tool_call_id", "cursor-internal-call-id")
 		return m
 	}()
 	got := downstreamToolArgs("read_args", args)
@@ -51,5 +73,51 @@ func TestDownstreamToolArgsMapsFilePath(t *testing.T) {
 	}
 	if strings.Contains(got, `"path"`) {
 		t.Fatalf("Cursor path leaked instead of file_path: %s", got)
+	}
+	if strings.Contains(got, "tool_call_id") {
+		t.Fatalf("Cursor internal tool_call_id leaked downstream: %s", got)
+	}
+}
+
+func TestRespondExecReadSendsResultAndStreamClose(t *testing.T) {
+	reg := testRegistry(t)
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	r := &Run{reg: reg, pw: writer}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- r.RespondExec("read_args", `{"file_path":"src/main.go"}`, 42, "exec-42", "package main", false)
+	}()
+
+	resultMsg := readAgentClientMessage(t, reg, reader)
+	execMsg, ok := get(resultMsg, "exec_client_message")
+	if !ok {
+		t.Fatal("first frame is not exec_client_message")
+	}
+	if got := getUint(execMsg, "id"); got != 42 {
+		t.Fatalf("result exec id = %d, want 42", got)
+	}
+	readResult, ok := get(execMsg, "read_result")
+	if !ok {
+		t.Fatal("first frame has no read_result")
+	}
+	success, ok := get(readResult, "success")
+	if !ok || getStr(success, "content") != "package main" {
+		t.Fatalf("read success content = %q", getStr(success, "content"))
+	}
+
+	closeMsg := readAgentClientMessage(t, reg, reader)
+	control, ok := get(closeMsg, "exec_client_control_message")
+	if !ok {
+		t.Fatal("second frame is not exec_client_control_message")
+	}
+	streamClose, ok := get(control, "stream_close")
+	if !ok || getUint(streamClose, "id") != 42 {
+		t.Fatalf("stream_close id = %d, want 42", getUint(streamClose, "id"))
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
 	}
 }
