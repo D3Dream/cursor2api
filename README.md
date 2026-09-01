@@ -1,149 +1,501 @@
 # cursor2api
 
-把本机 Cursor 账号变成 **Anthropic Messages API**(Claude Code 可用)和 **OpenAI 兼容 API**。
+cursor2api 把 Cursor Agent 的私有 Connect-RPC 协议转换成常见 AI API：
 
-不再通过 CLI 子进程——直接逆向 Cursor agent 的 Connect-RPC 协议直连 `agent.v1.AgentService`。服务端只做协议中转，Cursor/模型发出的 shell、文件读写、grep 等工具请求会返回给下游 Claude Code/Codex，由下游 Agent 在本地工作区执行。
+- Anthropic Messages：`/v1/messages`
+- OpenAI Chat Completions：`/v1/chat/completions`
+- OpenAI Responses：`/v1/responses`
 
-默认地址:`http://localhost:3010`
+服务端只做协议中转。Cursor 上游请求的 shell、文件读写、grep、目录枚举等工具调用会返回给下游 Agent，由 Claude Code、Codex 或其他调用方在本地工作区执行；VPS 不执行这些工具。
 
-需要:**Go ≥ 1.21**、已登录的 Cursor 账号(token 从系统 Keychain 读取,**仅 macOS**;Linux/Windows 请用 `CURSOR_API_KEY` / `CURSOR_ACCESS_TOKEN` 环境变量)。
+推荐部署顺序：
 
-> ⚠️ **安全提示**:`agent` 模式下模型可请求下游 Agent 执行 shell 命令与文件读写删——**持有 API key 等价于驱动下游工作区**。务必使用 HTTPS/VPN、强 key，并在下游 Agent 侧限制工作区和命令权限。
+1. 先在本机运行 `cursor2api.exe`，确认 token、模型和工具循环都正常。
+2. 再交叉编译 Linux amd64 二进制。
+3. 上传到 Ubuntu VPS，用二进制或 Docker 运行。
+4. 将 cursor2api 加入 sub2api 的 Docker 网络。
+5. 在 sub2api 中配置为内部上游。
 
----
-
-## 快速上手
-
-**1. 安装 Cursor CLI 并登录**(只为拿到本机凭证)
-
-```bash
-curl https://cursor.com/install -fsS | bash
-agent login
+```text
+Claude Code / Codex
+        |
+        v
+sub2api  统一入口、统一 key、账号调度
+        |
+        v
+cursor2api  Docker 内网服务
+        |
+        v
+Cursor Agent 后端
 ```
 
-**2. 构建并启动**
+## 1. 准备
 
-```bash
-cp config.example.json config.json   # 按需改 modelMap / apiKey
-go build -o cursor2api ./src
-./cursor2api
+需要：
+
+- Go 1.25 或更新版本
+- 一个已登录的 Cursor 账号 token
+- 一个用于保护 cursor2api 的强 API key
+
+Windows/Linux 无法从 macOS Keychain 读取 token，需要通过环境变量提供：
+
+```powershell
+$env:CURSOR_ACCESS_TOKEN = "你的-Cursor-Token"
 ```
 
-(可选)装成开机自启服务,免手动维护:
+也支持 `CURSOR_API_KEY`。不要把 Cursor token 配置到下游客户端，它只应该由 cursor2api 进程读取。
 
-```bash
-scripts/install-launchd.sh     # macOS launchd,崩溃自动拉起
+## 2. 本机运行和验证
+
+建议先在本机跑通，再部署 VPS。
+
+### 2.1 创建配置
+
+```powershell
+Copy-Item config.example.json config.json
+notepad config.json
 ```
 
-> 注意:不要同时手动跑 `./cursor2api` 和 launchd 服务——端口冲突,后者会无限重启、把 bind 错误刷满日志。
-
-**3. 验证**
-
-```bash
-curl http://localhost:3010/health
-# {"status":"ok","auth":"token_ok",...}
-
-curl -N -X POST http://localhost:3010/v1/messages \
-  -H 'x-api-key: sk-cursor2api' -H 'content-type: application/json' \
-  -d '{"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,
-       "messages":[{"role":"user","content":"hi"}]}'
-# 应看到 content_block_delta 流式输出
-```
-
-**4. Claude Code 接入**
-
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:3010
-export ANTHROPIC_API_KEY=sk-cursor2api
-export ANTHROPIC_MODEL=claude-sonnet-4-5   # 经 modelMap 映射到 Cursor 内部模型
-claude
-```
-
-工具调用(Read/Write/Edit/Bash/Grep/Glob 等)由服务端转发给下游 Agent，在下游 Agent 所在机器执行；VPS 不执行这些工具，也不需要挂载本地工作区。
-
-### 常见现象
-
-- **`model "X" is not usable on this Cursor account`**:Cursor 服务端按账号实时状态下发可用模型列表,限流/降级窗口内高级模型(claude/gpt)会临时消失,窗口过后自动恢复。请求不可用模型会立即 400 并附上当前可用列表;`/v1/models` 可随时查看。
-- **上游杀 run(空响应)**:会收到明确的 `empty response` 错误而不是无声中断;某轮超过 120s 无任何服务端事件也会报错回收,不会挂死。
-- **排查**:`CURSOR2API_DEBUG=1 ./cursor2api` 可打印每个上游协议帧与请求生命周期。
-
----
-
-## API
-
-认证:OpenAI 风格 `Authorization: Bearer <apiKey>` 或 Anthropic 风格 `x-api-key: <apiKey>`。
-
-多下游 Agent 共用一个 API key 时，可额外发送 `X-Agent-Session-ID`（每个本地 Agent 固定一个值）来隔离会话命名空间；Anthropic 优先使用 `metadata.user_id`，OpenAI 优先使用 `user`。
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/health` | 健康检查 |
-| GET | `/v1/models` | 模型列表(服务端实时可用状态,10min 缓存) |
-| POST | `/v1/messages` | **Anthropic Messages**(stream 支持) |
-| POST | `/v1/messages/count_tokens` | 粗略 token 估算 |
-| POST | `/v1/chat/completions` | OpenAI 对话(stream + tool_calls 支持) |
-
-### 模型
-
-`config.json` 的 `modelMap` 做请求模型 → Cursor 内部模型的映射;未匹配的模型名**直通**。可用模型以 `/v1/models` 实时为准(`agent models` 也可查),常见的有:
-
-`default`(auto 路由)、`claude-sonnet-5`、`claude-opus-4-8`、`claude-fable-5`、`gpt-5.6-sol`、`gpt-5.6-terra`、`composer-2.5`、`grok-4.5`,支持参数化如 `claude-opus-4-8[effort=high,context=300k]`。
-
-示例映射:
+本机配置示例：
 
 ```json
-"modelMap": {
-  "claude-sonnet-4-5": "claude-sonnet-5",
-  "claude-opus-4-1": "claude-opus-4-8",
-  "claude-haiku-4-5": "composer-2.5"
+{
+  "host": "127.0.0.1",
+  "port": 3010,
+  "apiKey": "local-test-key-change-me",
+  "cursorEndpoint": "https://agentn.global.api5.cursor.sh",
+  "clientVersion": "cli-2026.07.23-e383d2b",
+  "sessionTtlMs": 3600000,
+  "requestTimeoutMs": 300000,
+  "cursorMode": "agent",
+  "modelMap": {}
 }
 ```
 
-### 多轮对话
+`apiKey` 是访问 cursor2api 的 key，不是 Cursor token。
 
-客户端每次发完整历史。服务端按"上次响应指纹"匹配进行中的会话:
+### 2.2 构建 Windows exe
 
-- **命中**:cursor 侧 checkpoint blob 重放,只增量处理新消息(省 token,上下文完整)
-- **工具续接**:tool_use 挂起的会话,服务端重放工具调用,我们提交 tool_result 继续
-- **未命中**(冷启动/重启后):历史以文本形式嵌入首条消息,保证上下文可达
+```powershell
+go build -trimpath -ldflags="-s -w" -o cursor2api.exe ./src
+```
 
----
+### 2.3 启动
 
-## 配置
+必须在项目根目录启动，因为程序默认读取相对路径 `schema/cursor_fds.json`：
 
-`config.json`:
+```powershell
+.\cursor2api.exe .\config.json
+```
+
+### 2.4 健康检查
+
+```powershell
+curl.exe http://127.0.0.1:3010/health
+```
+
+### 2.5 测试 Responses
+
+```powershell
+curl.exe -X POST http://127.0.0.1:3010/v1/responses `
+  -H "Authorization: Bearer local-test-key-change-me" `
+  -H "Content-Type: application/json" `
+  -d '{"model":"default","input":"Reply with OK","stream":false}'
+```
+
+### 2.6 测试 Chat Completions
+
+```powershell
+curl.exe -X POST http://127.0.0.1:3010/v1/chat/completions `
+  -H "Authorization: Bearer local-test-key-change-me" `
+  -H "Content-Type: application/json" `
+  -d '{"model":"default","messages":[{"role":"user","content":"Reply with OK"}],"stream":false}'
+```
+
+### 2.7 Claude Code
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:3010"
+$env:ANTHROPIC_API_KEY = "local-test-key-change-me"
+claude
+```
+
+Codex 需要将 OpenAI-compatible provider 的 base URL 指向：
+
+```text
+http://127.0.0.1:3010/v1
+```
+
+并确认使用 `/v1/responses`。
+
+## 3. 交叉编译 Linux 二进制
+
+Ubuntu VPS 通常是 `x86_64`：
+
+```bash
+uname -m
+```
+
+对应 `amd64`。在 Windows PowerShell 项目根目录执行：
+
+```powershell
+New-Item -ItemType Directory -Force dist | Out-Null
+
+$env:CGO_ENABLED = "0"
+$env:GOOS = "linux"
+$env:GOARCH = "amd64"
+
+go build -trimpath -ldflags="-s -w" `
+  -o .\dist\cursor2api `
+  .\src
+```
+
+如果 VPS 是 `aarch64`，将 `GOARCH` 改为 `arm64`。
+
+## 4. VPS 直接运行二进制
+
+上传以下内容：
+
+```text
+dist/cursor2api
+schema/cursor_fds.json
+config.example.json
+```
+
+示例：
+
+```powershell
+ssh root@你的VPS "mkdir -p /opt/cursor2api/schema"
+scp .\dist\cursor2api root@你的VPS:/opt/cursor2api/
+scp .\schema\cursor_fds.json root@你的VPS:/opt/cursor2api/schema/
+scp .\config.example.json root@你的VPS:/opt/cursor2api/config.json
+```
+
+在 VPS 上：
+
+```bash
+cd /opt/cursor2api
+chmod +x cursor2api
+
+cp config.example.json config.json
+vi config.json
+```
+
+直接运行时可以绑定回环地址：
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 3010,
+  "apiKey": "强随机key"
+}
+```
+
+创建环境变量文件：
+
+```bash
+cat > /opt/cursor2api/.env <<'EOF'
+CURSOR_ACCESS_TOKEN=你的-Cursor-Token
+EOF
+chmod 600 /opt/cursor2api/.env
+```
+
+启动：
+
+```bash
+cd /opt/cursor2api
+set -a
+. ./.env
+set +a
+./cursor2api ./config.json
+```
+
+## 5. VPS Docker 部署预编译二进制
+
+如果 VPS 上安装了 Docker，推荐使用预编译二进制组装运行时镜像。这样 VPS 不需要安装 Go，也不会重新编译。
+
+### 5.1 准备上传目录
+
+在 Windows PowerShell：
+
+```powershell
+New-Item -ItemType Directory -Force deploy\schema | Out-Null
+
+Copy-Item .\dist\cursor2api deploy\cursor2api
+Copy-Item .\schema\cursor_fds.json deploy\schema\
+Copy-Item .\Dockerfile.prebuilt deploy\
+Copy-Item .\docker-compose.cursor2api.prebuilt.yml deploy\docker-compose.yml
+Copy-Item .\config.docker.example.json deploy\config.docker.json
+```
+
+上传：
+
+```powershell
+scp -r .\deploy root@你的VPS:/opt/cursor2api
+```
+
+### 5.2 VPS 配置
+
+```bash
+cd /opt/cursor2api
+vi config.docker.json
+```
+
+Docker 中必须监听所有容器内地址：
+
+```json
+{
+  "host": "0.0.0.0",
+  "port": 3010,
+  "apiKey": "cursor2api-internal-key-change-me",
+  "cursorEndpoint": "https://agentn.global.api5.cursor.sh",
+  "clientVersion": "cli-2026.07.23-e383d2b",
+  "sessionTtlMs": 3600000,
+  "requestTimeoutMs": 300000,
+  "cursorMode": "agent",
+  "modelMap": {}
+}
+```
+
+创建 token 文件：
+
+```bash
+cat > .env.cursor2api <<'EOF'
+CURSOR_ACCESS_TOKEN=你的-Cursor-Token
+EOF
+chmod 600 .env.cursor2api
+```
+
+### 5.3 组装镜像并启动
+
+```bash
+docker build -f Dockerfile.prebuilt -t cursor2api:linux-amd64 .
+docker compose up -d --no-build
+```
+
+查看日志：
+
+```bash
+docker compose logs -f cursor2api
+```
+
+当前 Compose 示例使用 `expose`，不是 `ports`，因此 3010 不会暴露到宿主机公网。
+
+## 6. 让不同 Docker Compose 项目加入同一个网络
+
+假设 sub2api 的真实网络名是：
+
+```text
+sub2api-deploy_sub2api-network
+```
+
+查看 sub2api 网络：
+
+```bash
+docker inspect sub2api \
+  --format '{{range $name, $value := .NetworkSettings.Networks}}{{$name}}{{"\n"}}{{end}}'
+```
+
+### 方式一：修改 cursor2api 的 Compose 配置
+
+编辑 `/opt/cursor2api/docker-compose.yml`：
+
+```yaml
+services:
+  cursor2api:
+    image: cursor2api:linux-amd64
+    container_name: cursor2api
+    restart: unless-stopped
+    env_file:
+      - .env.cursor2api
+    volumes:
+      - ./config.docker.json:/app/config.json:ro
+    expose:
+      - "3010"
+    networks:
+      - sub2api-network
+
+networks:
+  sub2api-network:
+    external: true
+    name: sub2api-deploy_sub2api-network
+```
+
+注意：
+
+- service 里的 `sub2api-network` 必须和顶层 `networks.sub2api-network` 一致。
+- `name` 才是真实 Docker 网络名。
+
+应用修改：
+
+```bash
+docker compose config
+docker compose up -d --no-build --force-recreate
+```
+
+### 方式二：临时把已存在容器接入网络
+
+```bash
+docker network connect sub2api-deploy_sub2api-network cursor2api
+```
+
+确认两个容器都在网络中：
+
+```bash
+docker network inspect sub2api-deploy_sub2api-network \
+  --format '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}'
+```
+
+应看到：
+
+```text
+sub2api
+cursor2api
+```
+
+测试 Docker 内网访问：
+
+```bash
+docker run --rm \
+  --network sub2api-deploy_sub2api-network \
+  curlimages/curl:latest \
+  http://cursor2api:3010/health
+```
+
+容器之间必须使用服务名或容器名：
+
+```text
+http://cursor2api:3010
+```
+
+不要使用 `localhost` 或 `127.0.0.1`。
+
+## 7. 对接 sub2api
+
+在 sub2api 中添加 OpenAI-compatible 上游：
+
+```text
+名称：cursor2api
+Base URL：http://cursor2api:3010/v1
+API Key：config.docker.json 里的 apiKey
+```
+
+接口对应关系：
+
+```text
+Chat Completions -> /v1/chat/completions
+Responses        -> /v1/responses
+Anthropic        -> /v1/messages
+```
+
+如果 sub2api 需要区分不同协议，可以分别配置：
+
+```text
+OpenAI base URL:    http://cursor2api:3010/v1
+Anthropic base URL: http://cursor2api:3010
+```
+
+不要把 cursor2api 的 3010 端口映射到公网。API key 等价于允许调用方驱动本地 Agent 工具执行，应仅通过 Docker 内网、VPN 或 HTTPS 反向代理访问。
+
+## 8. 多 Cursor 账号
+
+一个 cursor2api 进程只读取一个 `CURSOR_ACCESS_TOKEN`。需要调度多个账号时，运行多个实例：
+
+```text
+cursor2api-account-a
+cursor2api-account-b
+cursor2api-account-c
+```
+
+每个实例使用不同的：
+
+- `CURSOR_ACCESS_TOKEN`
+- 内部 `apiKey`
+- Docker 服务名
+
+然后在 sub2api 中配置多个上游：
+
+```text
+http://cursor2api-account-a:3010/v1
+http://cursor2api-account-b:3010/v1
+http://cursor2api-account-c:3010/v1
+```
+
+由 sub2api 对外提供统一 key 并做账号调度。
+
+## 9. API 和会话
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 健康检查 |
+| GET | `/v1/models` | 可用模型列表 |
+| POST | `/v1/messages` | Anthropic Messages |
+| POST | `/v1/messages/count_tokens` | token 粗略估算 |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions |
+| POST | `/v1/responses` | OpenAI Responses |
+
+认证方式：
+
+```http
+Authorization: Bearer <apiKey>
+```
+
+或：
+
+```http
+x-api-key: <apiKey>
+```
+
+会话标识优先级：
+
+- Responses：`previous_response_id`
+- Anthropic：`metadata.user_id`
+- OpenAI：`user`
+- 额外隔离：`X-Agent-Session-ID`
+
+`X-Agent-Session-ID` 不是 Claude Code 或 Codex 的标准保证字段。多个本地 Agent 共用服务时，建议由 wrapper、daemon 或反向代理稳定注入。
+
+## 10. 配置项
 
 | 字段 | 默认 | 说明 |
-|------|------|------|
-| `host` | `127.0.0.1` | 监听地址(只绑回环;局域网/Docker 访问设 `0.0.0.0`) |
+|---|---|---|
+| `host` | `127.0.0.1` | 监听地址；Docker 内使用 `0.0.0.0` |
 | `port` | `3010` | 监听端口 |
-| `apiKey` | `sk-cursor2api` | API 密钥(**生产环境务必改掉默认值**) |
-| `cursorEndpoint` | `https://agentn.global.api5.cursor.sh` | Cursor agent 后端 |
-| `cursorMode` | `agent` | Cursor 模式；工具执行始终转发给下游 Agent，VPS 不执行内置工具 |
-| `clientVersion` | `cli-2026.07.23-e383d2b` | 伪装 CLI 版本(Cursor 更新后可能要跟) |
-| `modelMap` | `{}` | 模型映射 |
-| `sessionTtlMs` | `3600000` | 会话缓存 TTL |
+| `apiKey` | `sk-cursor2api` | 访问 cursor2api 的 key |
+| `cursorEndpoint` | Cursor agent endpoint | 上游地址 |
+| `clientVersion` | 内置版本 | 伪装 CLI 版本 |
+| `cursorMode` | `agent` | `agent` 或 `ask` |
+| `sessionTtlMs` | `3600000` | 会话 TTL |
+| `requestTimeoutMs` | `300000` | 单次请求超时 |
+| `modelMap` | `{}` | 请求模型到 Cursor 模型映射 |
 
-环境变量:
+## 11. 打包 Release
 
-- `CURSOR_API_KEY` / `CURSOR_ACCESS_TOKEN`:跳过 Keychain 直接提供 token
-- `CURSOR_SCHEMA`:schema 文件路径(默认 `schema/cursor_fds.json`)
-- `CURSOR2API_DEBUG=1`:协议帧 + 请求生命周期调试日志
+不建议把二进制提交进 Git。建议发布 GitHub Release Asset。
 
-## 工作原理(逆向说明)
+```powershell
+$Version = "v0.1.0"
+$Pkg = "cursor2api_${Version}_linux_amd64"
 
-- Cursor agent CLI 是 Node 打包应用,经 Connect-RPC (protobuf) 直连 `agentn.global.api5.cursor.sh`
-- `scripts/extract_modules.py` 把 webpack bundle 拆成模块,`scripts/reflect_schema.js` 用迷你 Node 运行时反射内嵌的 pb 类,导出 `schema/cursor_fds.json`(FileDescriptorSet),Go 端 dynamicpb 直接使用
-- 认证用 keychain 里的 `cursor-access-token` + 伪装的 CLI 版本头
-- 工具注入走 `AgentRunRequest.mcp_tools`(服务端原生支持,模型可见 `mcp_cursor2api_*` 工具);内置工具的 `exec` 请求转成下游 API 的 tool call，收到 tool result 后再经 `shell_stream` / 对应 result + `streamClose{id}` 回包
-- 多轮历史是服务端 blob 存储:checkpoint 给 blob 引用,下一轮连同 `pre_fetched_blobs` 带回
-- 有待执行工具的 Cursor `Run` 会由服务端 live-run broker 跨多个 HTTP 请求保持；同一会话串行，不同会话并行，TTL 到期或服务重启后才退回 checkpoint replay
-- Cursor 更新 CLI 后,重跑 `python3 scripts/extract_modules.py <bundle>/index.js build/modules.js && node scripts/reflect_schema.js` 即可跟上协议
+New-Item -ItemType Directory -Force ".\dist\$Pkg\schema" | Out-Null
 
-## 注意事项
+Copy-Item .\dist\cursor2api ".\dist\$Pkg\cursor2api"
+Copy-Item .\schema\cursor_fds.json ".\dist\$Pkg\schema\"
+Copy-Item .\config.docker.example.json ".\dist\$Pkg\"
+Copy-Item .\Dockerfile.prebuilt ".\dist\$Pkg\"
+Copy-Item .\docker-compose.cursor2api.prebuilt.yml ".\dist\$Pkg\docker-compose.yml"
 
-- 逆向协议属灰色地带,仅限本机自用;Cursor 可能随时变更协议
-- VPS 不执行 Cursor 内置工具；但 API key 仍允许远程 Agent 驱动下游工具循环，必须使用强 key、HTTPS/VPN，并在下游 Agent 侧限制 workspace 和命令权限
-- 浏览器路径已加固:CORS 只反射回环 Origin、Private Network Access 仅对本机页面放行——公网网页无法经浏览器调用本机服务(默认 key 组合的最后一条暴露路径)。非浏览器客户端(curl/Claude Code)不受 CORS 影响
-- token 读取目前仅支持 macOS Keychain,其他平台用环境变量提供
-- `cmd/` 下的 poc* 是开发期验证程序,非产品组成部分
+tar -czf ".\dist\$Pkg.tar.gz" -C ".\dist" $Pkg
+Get-FileHash ".\dist\$Pkg.tar.gz" -Algorithm SHA256
+```
+
+上传 `tar.gz` 到 GitHub Release，并在说明中附 SHA256。
+
+## 12. 安全注意事项
+
+- 使用强 API key。
+- 不要提交 `config.json`、`config.docker.json`、`.env*` 或 Cursor token。
+- 不要把 3010 直接映射到公网。
+- 生产环境只允许 sub2api 所在 Docker 网络访问。
+- 下游 Agent 应限制工作区和命令权限。
+- 该项目依赖 Cursor 私有协议，Cursor 更新后协议可能变化。
