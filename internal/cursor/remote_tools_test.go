@@ -121,3 +121,49 @@ func TestRespondExecReadSendsResultAndStreamClose(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestHandleInteractionQueryApprovesWebTools(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		queryField    string
+		responseField string
+	}{
+		{name: "search", queryField: "web_search_request_query", responseField: "web_search_request_response"},
+		{name: "fetch", queryField: "web_fetch_request_query", responseField: "web_fetch_request_response"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := testRegistry(t)
+			serverMsg, err := reg.New("agent.v1.AgentServerMessage")
+			if err != nil {
+				t.Fatal(err)
+			}
+			query := sub(serverMsg, "interaction_query")
+			setUint(query, "id", 73)
+			sub(query, tt.queryField)
+
+			reader, writer := io.Pipe()
+			defer reader.Close()
+			defer writer.Close()
+			r := &Run{reg: reg, pw: writer, events: make(chan Event, 1)}
+			done := make(chan struct{})
+			go func() {
+				r.handle(serverMsg)
+				close(done)
+			}()
+
+			clientMsg := readAgentClientMessage(t, reg, reader)
+			response, ok := get(clientMsg, "interaction_response")
+			if !ok {
+				t.Fatal("response has no interaction_response")
+			}
+			if got := getUint(response, "id"); got != 73 {
+				t.Fatalf("interaction response id = %d, want 73", got)
+			}
+			result, ok := get(response, tt.responseField)
+			if !ok || !has(result, "approved") {
+				t.Fatalf("interaction response has no %s.approved", tt.responseField)
+			}
+			<-done
+		})
+	}
+}

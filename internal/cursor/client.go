@@ -812,15 +812,53 @@ func (r *Run) handle(msg *dynamicpb.Message) {
 		r.handleCheckpoint(cp)
 		return
 	}
+	if query, ok := get(msg, "interaction_query"); ok {
+		r.handleInteractionQuery(query)
+		return
+	}
 	// 其他：打印顶层字段名，便于发现未知消息（如安全围栏通知）。
 	// 已知但未处理的类型：exec_server_control_message（服务端取消/中止 exec 的
-	// 控制通道）与 interaction_query——当前无对应协议语义实现，只记录不动作。
+	// 控制通道）。
 	md := msg.Descriptor()
 	for i := 0; i < md.Fields().Len(); i++ {
 		fd := md.Fields().Get(i)
 		if msg.Has(fd) {
 			log.Printf("[cursor] recv unhandled server message: %s", fd.Name())
 		}
+	}
+}
+
+func (r *Run) handleInteractionQuery(query *dynamicpb.Message) {
+	var responseField string
+	switch {
+	case has(query, "web_search_request_query"):
+		responseField = "web_search_request_response"
+	case has(query, "web_fetch_request_query"):
+		responseField = "web_fetch_request_response"
+	default:
+		md := query.Descriptor()
+		for i := 0; i < md.Fields().Len(); i++ {
+			fd := md.Fields().Get(i)
+			if query.Has(fd) && fd.Kind() == protoreflect.MessageKind {
+				log.Printf("[cursor] recv unhandled interaction query: %s", fd.Name())
+			}
+		}
+		return
+	}
+
+	acm, err := r.reg.New("agent.v1.AgentClientMessage")
+	if err != nil {
+		r.emit(Event{Kind: EventError, Err: fmt.Errorf("create interaction response: %w", err)})
+		return
+	}
+	response := sub(acm, "interaction_response")
+	queryID := getUint(query, "id")
+	setUint(response, "id", queryID)
+	result := sub(response, responseField)
+	sub(result, "approved")
+	dlog("approve interaction query id=%d type=%s", queryID, responseField)
+	if err := r.send(acm); err != nil {
+		r.emit(Event{Kind: EventError, Err: fmt.Errorf("send interaction response: %w", err)})
 	}
 }
 
