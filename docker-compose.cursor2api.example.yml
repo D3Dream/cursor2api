@@ -1,0 +1,18 @@
+services:
+  cursor2api:
+    build:
+      context: .
+    container_name: cursor2api
+    restart: unless-stopped
+    env_file:
+      - .env.cursor2api
+    volumes:
+      - ./config.docker.json:/app/config.json:ro
+    expose:
+      - "3010"
+    networks:
+      - ai-gateway
+
+networks:
+  ai-gateway:
+    external: true

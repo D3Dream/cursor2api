@@ -1,0 +1,14 @@
+{
+  "host": "127.0.0.1",
+  "port": 3010,
+  "apiKey": "sk-cursor2api",
+  "cursorEndpoint": "https://agentn.global.api5.cursor.sh",
+  "clientVersion": "cli-2026.07.23-e383d2b",
+  "sessionTtlMs": 3600000,
+  "requestTimeoutMs": 300000,
+  "modelMap": {
+    "claude-sonnet-4-5": "claude-sonnet-5",
+    "claude-opus-4-1": "claude-opus-4-8",
+    "claude-haiku-4-5": "composer-2.5"
+  }
+}

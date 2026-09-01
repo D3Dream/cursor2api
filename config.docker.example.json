@@ -1,0 +1,11 @@
+{
+  "host": "0.0.0.0",
+  "port": 3010,
+  "apiKey": "replace-with-a-long-random-internal-key",
+  "cursorEndpoint": "https://agentn.global.api5.cursor.sh",
+  "clientVersion": "cli-2026.07.23-e383d2b",
+  "sessionTtlMs": 3600000,
+  "requestTimeoutMs": 300000,
+  "cursorMode": "agent",
+  "modelMap": {}
+}

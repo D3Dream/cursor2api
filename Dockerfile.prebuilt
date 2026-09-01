@@ -1,0 +1,15 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --no-create-home cursor2api
+
+WORKDIR /app
+COPY cursor2api /app/cursor2api
+COPY schema /app/schema
+RUN chmod 0755 /app/cursor2api
+
+USER 10001:10001
+EXPOSE 3010
+ENTRYPOINT ["/app/cursor2api", "/app/config.json"]

@@ -1,0 +1,8 @@
+.git
+.gocache
+.gopath
+logs
+config.json
+cursor2api
+cursor2api.exe
+*.test
