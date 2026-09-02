@@ -128,6 +128,24 @@ func (s *ConversationStore) FindByPendingToolID(namespace, toolID string) *Conve
 	return found
 }
 
+// DeleteConversation invalidates every fingerprint entry belonging to one exact
+// Cursor conversation. Namespace is checked as defense-in-depth so a fallback
+// cannot remove another caller's conversation even if IDs collided.
+func (s *ConversationStore) DeleteConversation(namespace, conversationID string) {
+	if namespace == "" || conversationID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purge()
+	prefix := namespace + ":"
+	for hash, conversation := range s.byHash {
+		if conversation.ID == conversationID && strings.HasPrefix(conversation.LastRespHash, prefix) {
+			delete(s.byHash, hash)
+		}
+	}
+}
+
 // maxConversations 会话存储上限：每个会话携带 Checkpoint（含 blobs，
 // 单 run 上限 256MB），只按 TTL 清理会被大量会话撑爆内存。
 // 超限按 LastUsed 淘汰最久未用（LRU）。

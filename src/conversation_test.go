@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,6 +61,71 @@ func TestResumeConversationCarriesID(t *testing.T) {
 	}
 	if conv2.ID != opts1.ConversationID {
 		t.Fatalf("续接 ID 应与首轮一致: first=%q second=%q", opts1.ConversationID, conv2.ID)
+	}
+}
+
+func TestColdAnthropicRunOptionsReplaysToolPair(t *testing.T) {
+	srv := &Server{cfg: Config{CursorMode: "agent"}}
+	req := &anthropicRequest{
+		System: "be concise",
+		Tools: []anthropicTool{{
+			Name: "Read", Description: "read a file", InputSchema: json.RawMessage(`{"type":"object"}`),
+		}},
+		Messages: []anthropicMessage{
+			{Role: "user", Content: "inspect config"},
+			{Role: "assistant", Content: []any{map[string]any{
+				"type": "tool_use", "id": "toolu_1", "name": "Read",
+				"input": map[string]any{"file_path": "config.json"},
+			}}},
+			{Role: "user", Content: []any{map[string]any{
+				"type": "tool_result", "tool_use_id": "toolu_1", "content": "file contents",
+			}}},
+		},
+	}
+
+	opts := srv.coldAnthropicRunOptions(req, "cursor-model")
+	if opts.ConversationID != "" || opts.State != nil {
+		t.Fatalf("cold fallback must not reuse state: id=%q state=%v", opts.ConversationID, opts.State)
+	}
+	if len(opts.Tools) != 1 || opts.Tools[0].Name != "ccRead" {
+		t.Fatalf("unexpected tools: %#v", opts.Tools)
+	}
+	for _, want := range []string{"toolu_1", "Read", "config.json", "file contents"} {
+		if !strings.Contains(opts.Prompt, want) {
+			t.Fatalf("cold prompt missing %q: %s", want, opts.Prompt)
+		}
+	}
+}
+
+func TestDeleteConversationOnlyInvalidatesExactNamespace(t *testing.T) {
+	store := NewConversationStore(time.Minute)
+	const conversationID = "conv-fallback"
+	store.Save(&Conversation{
+		ID: conversationID, LastRespHash: "ns-a:assistant-a",
+		PendingTools: []PendingTool{{ToolUseID: "toolu-old", Name: "Edit"}},
+	})
+	store.Save(&Conversation{ID: conversationID, LastRespHash: "ns-b:assistant-b"})
+
+	if store.FindByPendingToolID("ns-a", "toolu-old") == nil {
+		t.Fatal("test setup did not index the old pending tool")
+	}
+	store.DeleteConversation("ns-a", conversationID)
+	if store.FindByRespHash("ns-a:assistant-a") != nil {
+		t.Fatal("old namespace state survived fallback invalidation")
+	}
+	if store.FindByPendingToolID("ns-a", "toolu-old") != nil {
+		t.Fatal("old pending-tool state survived fallback invalidation")
+	}
+	if store.FindByRespHash("ns-b:assistant-b") == nil {
+		t.Fatal("fallback invalidation removed another namespace")
+	}
+}
+
+func TestApplyAnthropicColdHistoryHandlesEmptyMessages(t *testing.T) {
+	opts := cursor.RunOptions{}
+	applyAnthropicColdHistory(&anthropicRequest{}, &opts)
+	if opts.Prompt != "(continue)" {
+		t.Fatalf("empty cold history prompt = %q, want continue sentinel", opts.Prompt)
 	}
 }
 

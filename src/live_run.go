@@ -12,22 +12,32 @@ import (
 // liveRun is a Cursor bidi stream paused at one or more downstream tool calls.
 // Its lifetime is independent from the HTTP request that exposed the calls.
 type liveRun struct {
-	mu       sync.Mutex
-	run      *cursor.Run
-	cancel   context.CancelFunc
-	convID   string
-	pending  []PendingTool
-	lastUsed time.Time
-	closed   bool
+	mu        sync.Mutex
+	respondMu sync.Mutex
+	run       *cursor.Run
+	cancel    context.CancelFunc
+	convID    string
+	pending   []PendingTool
+	lastUsed  time.Time
+	closed    bool
 }
 
-func (l *liveRun) respond(results []pendingResult) error {
+func (l *liveRun) respond(ctx context.Context, results []pendingResult) error {
+	l.respondMu.Lock()
+	defer l.respondMu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.run == nil || l.closed {
+		l.mu.Unlock()
 		return fmt.Errorf("live run is closed")
 	}
 	if len(results) == 0 {
+		l.mu.Unlock()
 		return fmt.Errorf("no tool results supplied for live run")
 	}
 	byID := make(map[string]PendingTool, len(l.pending))
@@ -38,26 +48,49 @@ func (l *liveRun) respond(results []pendingResult) error {
 	for _, result := range results {
 		p, ok := byID[result.Tool.ToolUseID]
 		if !ok {
+			l.mu.Unlock()
 			return fmt.Errorf("tool result %q does not belong to live run", result.Tool.ToolUseID)
 		}
 		seen[p.ToolUseID] = true
 	}
 	if len(seen) != len(byID) || len(results) != len(byID) {
+		l.mu.Unlock()
 		return fmt.Errorf("live run requires all %d pending tool results, got %d", len(byID), len(seen))
 	}
+	run := l.run
+	pending := make(map[string]PendingTool, len(byID))
+	for id, p := range byID {
+		pending[id] = p
+	}
+	l.mu.Unlock()
+
 	for _, result := range results {
-		p := byID[result.Tool.ToolUseID]
-		var err error
-		if p.ExecName == "" || p.ExecName == "mcp_args" {
-			err = l.run.RespondTool(p.ExecID, p.ExecIDStr, result.Text, result.IsErr)
-		} else {
-			err = l.run.RespondExec(p.ExecName, p.Input, p.ExecID, p.ExecIDStr, result.Text, result.IsErr)
-		}
-		if err != nil {
-			return err
+		p := pending[result.Tool.ToolUseID]
+		errCh := make(chan error, 1)
+		go func() {
+			if p.ExecName == "" || p.ExecName == "mcp_args" {
+				errCh <- run.RespondTool(p.ExecID, p.ExecIDStr, result.Text, result.IsErr)
+			} else {
+				errCh <- run.RespondExec(p.ExecName, p.Input, p.ExecID, p.ExecIDStr, result.Text, result.IsErr)
+			}
+		}()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			l.close()
+			return ctx.Err()
 		}
 	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return fmt.Errorf("live run is closed")
+	}
 	l.lastUsed = time.Now()
+	l.mu.Unlock()
 	return nil
 }
 

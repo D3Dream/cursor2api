@@ -17,9 +17,13 @@ import (
 // clients normally send only previous_response_id plus function_call_output
 // on the next request, so assistant-message fingerprinting is insufficient.
 type responseSession struct {
-	Conv *Conversation
-	NS   string
+	Conv     *Conversation
+	NS       string
+	Messages []ChatMessage // bounded to keep response-session memory predictable
+	LastUsed time.Time
 }
+
+const maxResponseHistoryMessages = 512
 
 type responsesRequest struct {
 	Model            string          `json:"model"`
@@ -159,6 +163,10 @@ func (s *Server) responseSessionGet(id string) (responseSession, bool) {
 		s.responses = make(map[string]responseSession)
 	}
 	v, ok := s.responses[id]
+	if ok {
+		v.LastUsed = time.Now()
+		s.responses[id] = v
+	}
 	return v, ok
 }
 
@@ -171,16 +179,65 @@ func (s *Server) responseSessionPut(id string, value responseSession) {
 	if s.responses == nil {
 		s.responses = make(map[string]responseSession)
 	}
+	value.LastUsed = time.Now()
 	if len(s.responses) >= maxConversations {
+		var oldestID string
+		var oldest time.Time
 		for k := range s.responses {
-			delete(s.responses, k)
-			break
+			v := s.responses[k]
+			if oldestID == "" || v.LastUsed.Before(oldest) {
+				oldestID, oldest = k, v.LastUsed
+			}
+		}
+		if oldestID != "" {
+			delete(s.responses, oldestID)
 		}
 	}
 	s.responses[id] = value
 }
 
 func newResponseID() string { return "resp_" + randHex12() }
+
+func responseHistory(base, current []ChatMessage, res turnResult) []ChatMessage {
+	out := make([]ChatMessage, 0, len(base)+len(current)+1)
+	out = append(out, base...)
+	out = append(out, current...)
+	if res.text.Len() > 0 || len(res.toolCalls) > 0 {
+		m := ChatMessage{Role: "assistant"}
+		if res.text.Len() > 0 {
+			m.Content = res.text.String()
+		}
+		for _, tc := range res.toolCalls {
+			var call openAIToolCall
+			call.ID, call.Type = tc.ToolUseID, "function"
+			call.Function.Name, call.Function.Arguments = tc.Name, tc.Input
+			m.ToolCalls = append(m.ToolCalls, call)
+		}
+		out = append(out, m)
+	}
+	if len(out) > maxResponseHistoryMessages {
+		// Keep leading system/developer instructions and the newest conversation
+		// tail. This bounds memory while retaining the active turn context.
+		prefix := 0
+		for prefix < len(out) && (out[prefix].Role == "system" || out[prefix].Role == "developer") {
+			prefix++
+		}
+		if prefix >= maxResponseHistoryMessages {
+			return out[len(out)-maxResponseHistoryMessages:]
+		}
+		keepTail := maxResponseHistoryMessages - prefix
+		if keepTail < 1 {
+			keepTail = 1
+		}
+		if prefix+keepTail < len(out) {
+			trimmed := make([]ChatMessage, 0, maxResponseHistoryMessages)
+			trimmed = append(trimmed, out[:prefix]...)
+			trimmed = append(trimmed, out[len(out)-keepTail:]...)
+			out = trimmed
+		}
+	}
+	return out
+}
 
 func responseOutput(id, model string, res turnResult, created int64) map[string]any {
 	output := make([]any, 0, 1+len(res.toolCalls))
@@ -207,13 +264,16 @@ func responseOutput(id, model string, res turnResult, created int64) map[string]
 	}
 }
 
-func (s *Server) saveResponseSession(id string, res turnResult, opts cursor.RunOptions, conv *Conversation, ns string) {
+func (s *Server) saveResponseSession(id string, res turnResult, opts cursor.RunOptions, conv *Conversation, ns string, history []ChatMessage) {
 	s.saveOpenAIConversation(res, opts, conv, ns)
 	ck := res.lastCk
 	if ck == nil && conv != nil {
 		ck = conv.Checkpoint
 	}
-	s.responseSessionPut(id, responseSession{Conv: &Conversation{ID: opts.ConversationID, Checkpoint: ck, PendingTools: res.toolCalls}, NS: ns})
+	s.responseSessionPut(id, responseSession{
+		Conv: &Conversation{ID: opts.ConversationID, Checkpoint: ck, PendingTools: res.toolCalls},
+		NS:   ns, Messages: responseHistory(nil, history, res),
+	})
 }
 
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
@@ -254,14 +314,29 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	ns := hashText(nsSeed)
 	var conv *Conversation
 	var results []pendingResult
+	var baseHistory []ChatMessage
+	coldOpts := opts
 	if req.PreviousResponse != "" {
-		if session, ok := s.responseSessionGet(req.PreviousResponse); ok {
-			conv, ns = session.Conv, session.NS
-			results = responseResults(chatReq.Messages, conv.PendingTools)
-			opts.ConversationID, opts.State, opts.History = conv.ID, conv.Checkpoint, nil
-			if len(results) > 0 {
-				opts.Prompt = ""
+		session, ok := s.responseSessionGet(req.PreviousResponse)
+		if !ok || session.Conv == nil {
+			writeError(w, http.StatusNotFound, "previous_response_id was not found or has expired", "invalid_request_error")
+			return
+		}
+		conv, ns = session.Conv, session.NS
+		baseHistory = append(baseHistory, session.Messages...)
+		fullMessages := append(append([]ChatMessage(nil), baseHistory...), chatReq.Messages...)
+		coldChatReq := *chatReq
+		coldChatReq.Messages = fullMessages
+		if rebuilt, rebuildErr := openAIToRunOptions(&coldChatReq, model, s.cfg.CursorMode); rebuildErr == nil {
+			coldOpts = rebuilt
+			if len(chatReq.Messages) == 0 || chatReq.Messages[len(chatReq.Messages)-1].Role != "user" {
+				coldOpts.Prompt = "(continue)"
 			}
+		}
+		results = responseResults(chatReq.Messages, conv.PendingTools)
+		opts.ConversationID, opts.State, opts.History = conv.ID, conv.Checkpoint, nil
+		if len(results) > 0 {
+			opts.Prompt = ""
 		}
 	}
 	ensureConversationID(&opts)
@@ -278,15 +353,31 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var run *cursor.Run
 	var runCancel context.CancelFunc
 	var live *liveRun
+	rebuildFromFullHistory := func(reason string) {
+		dlog("responses: live continuation failed (%v); rebuild from full response history", reason)
+		if live != nil && conv != nil {
+			s.liveStore().Remove(conv.ID, live)
+		}
+		if conv != nil {
+			s.conversations.DeleteConversation(ns, conv.ID)
+		}
+		opts = coldOpts
+		ensureConversationID(&opts)
+		conv, live, run, results = nil, nil, nil, nil
+	}
 	if conv != nil {
 		live = s.liveStore().Get(conv.ID)
 		if live != nil {
-			if err := live.respond(results); err != nil {
-				writeError(w, http.StatusConflict, err.Error(), "api_error")
-				return
+			if err := live.respond(ctx, results); err != nil {
+				rebuildFromFullHistory(err.Error())
+			} else {
+				run = live.currentRun()
+				if run == nil {
+					rebuildFromFullHistory("live Cursor run is no longer available")
+				} else {
+					results = nil
+				}
 			}
-			run = live.currentRun()
-			results = nil
 		}
 	}
 	if run == nil {
@@ -323,10 +414,13 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		} else {
 			live.updatePending(res.toolCalls)
 		}
-		s.saveResponseSession(id, res, opts, conv, ns)
+		s.saveResponseSession(id, res, opts, conv, ns, append(append([]ChatMessage(nil), baseHistory...), chatReq.Messages...))
 	} else {
 		if live != nil {
 			s.liveStore().Remove(opts.ConversationID, live)
+			if conv != nil && res.err != nil {
+				s.conversations.DeleteConversation(ns, conv.ID)
+			}
 		} else {
 			if runCancel != nil {
 				runCancel()
@@ -334,7 +428,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			run.Close()
 		}
 		if res.err == nil {
-			s.saveResponseSession(id, res, opts, conv, ns)
+			s.saveResponseSession(id, res, opts, conv, ns, append(append([]ChatMessage(nil), baseHistory...), chatReq.Messages...))
 		}
 	}
 }

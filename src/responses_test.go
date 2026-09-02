@@ -1,11 +1,40 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"cursor2api/internal/cursor"
 )
+
+func TestResponsesUnknownPreviousResponseReturnsNotFound(t *testing.T) {
+	srv := &Server{
+		cfg:           Config{APIKey: "test-key"},
+		conversations: NewConversationStore(time.Minute),
+		liveRuns:      NewLiveRunStore(time.Minute),
+		models:        cursor.NewModelCache(time.Minute),
+		responses:     make(map[string]responseSession),
+	}
+	body := []byte(`{"model":"default","input":"continue","previous_response_id":"resp_missing"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["error"] == nil {
+		t.Fatalf("missing error body: %v", got)
+	}
+}
 
 func TestResponseInputMessages(t *testing.T) {
 	raw := json.RawMessage(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"read file"}]},{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"a.txt\"}"},{"type":"function_call_output","call_id":"call_1","output":"hello"}]`)

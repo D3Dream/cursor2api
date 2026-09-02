@@ -135,37 +135,94 @@ type pendingResult struct {
 	IsErr bool
 }
 
-// planRun 根据请求和已有会话决定本次 run 的参数。
-// 返回 opts、待提交的工具结果（服务端重放时应答）、匹配的会话、会话命名空间。
-func (s *Server) planRun(req *anthropicRequest, model string) (cursor.RunOptions, []pendingResult, *Conversation, string) {
-	opts := cursor.RunOptions{
-		Model:        model,
-		SystemPrompt: systemText(req.System),
-	}
-	// 命名空间：首条 user 消息的指纹，隔离不同会话里相同的 assistant 响应；
-	// 混入 metadata.user_id（Claude Code 的 session 标识），并行会话同开场白不再互串
+func anthropicNamespace(req *anthropicRequest) string {
 	nsSeed := firstUserText(req.Messages)
 	if req.Metadata != nil && req.Metadata.UserID != "" {
 		nsSeed = req.Metadata.UserID + "|" + nsSeed
 	}
-	ns := hashText(nsSeed)
-	if s.cfg.CursorMode == "ask" {
+	return hashText(nsSeed)
+}
+
+func anthropicRunOptions(req *anthropicRequest, model, cursorMode string) cursor.RunOptions {
+	opts := cursor.RunOptions{Model: model, SystemPrompt: systemText(req.System)}
+	if cursorMode == "ask" {
 		opts.Mode = 2
 	} else {
 		opts.Mode = 1
 	}
 	for _, t := range req.Tools {
-		// 统一加 cc 前缀：避免与 Cursor 内置工具同名导致服务端静默空响应
-		// （实测 Read/Write/WebFetch/WebSearch 原名会触发，返回时剥掉前缀）。
-		// round-trip 安全：注入加一次 "cc"，返回剥一次，客户端工具名含 "cc"
-		// 开头也能还原（"ccRead"→"cccRead"→"ccRead"）；仅当 Cursor 原生
-		// 工具名以 "cc" 开头时会被误剥，目前不存在这类工具。
 		opts.Tools = append(opts.Tools, cursor.ToolDef{
 			Name:        "cc" + t.Name,
 			Description: t.Description,
 			InputSchema: string(t.InputSchema),
 		})
 	}
+	return opts
+}
+
+func applyAnthropicColdHistory(req *anthropicRequest, opts *cursor.RunOptions) {
+	if len(req.Messages) == 0 {
+		if opts.Prompt == "" {
+			opts.Prompt = "(continue)"
+		}
+		return
+	}
+	last := len(req.Messages) - 1
+	for i, m := range req.Messages {
+		blocks := parseContent(m.Content)
+		isLastUser := i == last && m.Role == "user"
+		for _, b := range blocks {
+			switch b.Type {
+			case "text":
+				if isLastUser {
+					opts.Prompt += b.Text
+				} else if m.Role == "user" {
+					opts.History = append(opts.History, cursor.HistoryMessage{Role: "user", Text: b.Text})
+				} else {
+					opts.History = append(opts.History, cursor.HistoryMessage{Role: "assistant", Text: b.Text})
+				}
+			case "tool_use":
+				opts.History = append(opts.History, cursor.HistoryMessage{
+					Role: "assistant", ToolCallID: b.ID, ToolName: b.Name, ArgsJSON: string(b.Input),
+				})
+			case "tool_result":
+				opts.History = append(opts.History, cursor.HistoryMessage{
+					Role: "tool", ToolCallID: b.ToolUseID, Text: toolResultText(b.Content), IsError: b.IsError,
+				})
+			case "image", "document":
+				role := "user"
+				if m.Role == "assistant" {
+					role = "assistant"
+				}
+				opts.History = append(opts.History, cursor.HistoryMessage{
+					Role: role, Text: "[" + b.Type + " omitted: not supported by upstream]",
+				})
+			}
+		}
+	}
+	if len(opts.History) > 0 {
+		opts.Prompt = embedHistoryAsText(opts.History) + opts.Prompt
+		opts.History = nil
+	}
+	if opts.Prompt == "" {
+		opts.Prompt = "(continue)"
+	}
+	if last := req.Messages[len(req.Messages)-1]; last.Role == "assistant" {
+		opts.Prompt = "(Continue exactly from where your last message left off. Do not repeat it.)\n" + opts.Prompt
+	}
+}
+
+func (s *Server) coldAnthropicRunOptions(req *anthropicRequest, model string) cursor.RunOptions {
+	opts := anthropicRunOptions(req, model, s.cfg.CursorMode)
+	applyAnthropicColdHistory(req, &opts)
+	return opts
+}
+
+func (s *Server) planRun(req *anthropicRequest, model string) (cursor.RunOptions, []pendingResult, *Conversation, string) {
+	opts := anthropicRunOptions(req, model, s.cfg.CursorMode)
+	// 命名空间：首条 user 消息的指纹，隔离不同会话里相同的 assistant 响应；
+	// 混入 metadata.user_id（Claude Code 的 session 标识），并行会话同开场白不再互串
+	ns := anthropicNamespace(req)
 
 	if len(req.Messages) == 0 {
 		return opts, nil, nil, ns
@@ -203,55 +260,7 @@ func (s *Server) planRun(req *anthropicRequest, model string) (cursor.RunOptions
 	}
 
 	if conv == nil {
-		// 冷启动：全量历史 + 最后一条 user 文本
-		last := len(req.Messages) - 1
-		for i, m := range req.Messages {
-			blocks := parseContent(m.Content)
-			isLastUser := i == last && m.Role == "user"
-			for _, b := range blocks {
-				switch b.Type {
-				case "text":
-					if isLastUser {
-						opts.Prompt += b.Text
-					} else if m.Role == "user" {
-						opts.History = append(opts.History, cursor.HistoryMessage{Role: "user", Text: b.Text})
-					} else {
-						opts.History = append(opts.History, cursor.HistoryMessage{Role: "assistant", Text: b.Text})
-					}
-				case "tool_use":
-					opts.History = append(opts.History, cursor.HistoryMessage{
-						Role: "assistant", ToolCallID: b.ID, ToolName: b.Name, ArgsJSON: string(b.Input),
-					})
-				case "tool_result":
-					opts.History = append(opts.History, cursor.HistoryMessage{
-						Role: "tool", ToolCallID: b.ToolUseID, Text: toolResultText(b.Content), IsError: b.IsError,
-					})
-				case "image", "document":
-					// 协议无法传图/文档：降级为占位文本，模型至少知道"这里有张图"，
-					// 而不是把纯图片消息当成什么都没说
-					role := "user"
-					if m.Role == "assistant" {
-						role = "assistant"
-					}
-					opts.History = append(opts.History, cursor.HistoryMessage{
-						Role: role, Text: "[" + b.Type + " omitted: not supported by upstream]",
-					})
-				}
-			}
-		}
-		// 历史以文本形式嵌入 prompt（conversation_history 字段会被服务端忽略）
-		if len(opts.History) > 0 {
-			opts.Prompt = embedHistoryAsText(opts.History) + opts.Prompt
-			opts.History = nil // 不再重复传递
-		}
-		if opts.Prompt == "" {
-			opts.Prompt = "(continue)"
-		}
-		// 末条为 assistant（Anthropic prefill 用法）：协议不支持强制续写，
-		// 降级为明确指令（prefill 文本已在嵌入历史的末尾，模型可顺势续写）
-		if last := req.Messages[len(req.Messages)-1]; last.Role == "assistant" {
-			opts.Prompt = "(Continue exactly from where your last message left off. Do not repeat it.)\n" + opts.Prompt
-		}
+		applyAnthropicColdHistory(req, &opts)
 		return opts, nil, nil, ns
 	}
 
@@ -532,9 +541,15 @@ func (s *Server) runTurn(ctx context.Context, run *cursor.Run, results []pending
 				results[replayIdx], results[idx] = results[idx], results[replayIdx]
 				replayIdx++
 				if r0.Tool.ExecName == "" || r0.Tool.ExecName == "mcp_args" {
-					_ = run.RespondTool(ev.ExecID, ev.ExecIDStr, r0.Text, r0.IsErr)
+					if err := run.RespondTool(ev.ExecID, ev.ExecIDStr, r0.Text, r0.IsErr); err != nil {
+						res.err = fmt.Errorf("cursor: replay tool result: %w", err)
+						return true
+					}
 				} else {
-					_ = run.RespondExec(r0.Tool.ExecName, r0.Tool.Input, ev.ExecID, ev.ExecIDStr, r0.Text, r0.IsErr)
+					if err := run.RespondExec(r0.Tool.ExecName, r0.Tool.Input, ev.ExecID, ev.ExecIDStr, r0.Text, r0.IsErr); err != nil {
+						res.err = fmt.Errorf("cursor: replay tool result: %w", err)
+						return true
+					}
 				}
 				resetIdle(stallTimeout)
 				return false
@@ -696,31 +711,45 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	var live *liveRun
 	var err error
 	liveStore := s.liveStore()
+	rebuildFromFullHistory := func(reason string) {
+		dlog("messages: live continuation failed (%v); rebuild from full client history", reason)
+		if live != nil && conv != nil {
+			liveStore.Remove(conv.ID, live)
+		}
+		if conv != nil {
+			s.conversations.DeleteConversation(ns, conv.ID)
+		}
+		opts = s.coldAnthropicRunOptions(&req, model)
+		ensureConversationID(&opts)
+		conv, live, run, results = nil, nil, nil, nil
+	}
 	if conv != nil {
 		live = liveStore.Get(conv.ID)
 		if live != nil {
 			if len(results) == 0 {
 				pending := live.pendingTools()
 				if len(pending) == 0 {
-					writeAnthropicError(w, http.StatusConflict, "api_error", "live Cursor run has no pending tools")
+					rebuildFromFullHistory("live run has no pending tools")
+				} else {
+					dlog("messages: replay %d pending tools while awaiting permission/results", len(pending))
+					replayAnthropicPending(w, &req, pending)
 					return
 				}
-				dlog("messages: replay %d pending tools while awaiting permission/results", len(pending))
-				replayAnthropicPending(w, &req, pending)
-				return
 			}
-			if err := live.respond(results); err != nil {
-				writeAnthropicError(w, http.StatusConflict, "api_error", err.Error())
-				return
+			if live != nil {
+				if err := live.respond(ctx, results); err != nil {
+					rebuildFromFullHistory(err.Error())
+				} else {
+					run = live.currentRun()
+					if run == nil {
+						rebuildFromFullHistory("live Cursor run is no longer available")
+					} else {
+						// The live stream is already paused at these execs; they were just
+						// answered directly. Do not let runTurn replay them a second time.
+						results = nil
+					}
+				}
 			}
-			run = live.currentRun()
-			if run == nil {
-				writeAnthropicError(w, http.StatusConflict, "api_error", "live Cursor run is no longer available")
-				return
-			}
-			// The live stream is already paused at these execs; they were just
-			// answered directly. Do not let runTurn replay them a second time.
-			results = nil
 		}
 	}
 	if run == nil {
@@ -752,6 +781,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	} else {
 		if live != nil {
 			liveStore.Remove(opts.ConversationID, live)
+			if conv != nil && res.err != nil {
+				s.conversations.DeleteConversation(ns, conv.ID)
+			}
 		} else {
 			if runCancel != nil {
 				runCancel()

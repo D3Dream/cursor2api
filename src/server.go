@@ -282,6 +282,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
+	coldOpts := opts
 	if err := s.checkModelUsable(opts.Model); err != nil {
 		// OpenAI 语义：模型不可用是 404 + code=model_not_found（客户端按 code 做降级决策）
 		code := "model_not_found"
@@ -343,20 +344,32 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var runCancel context.CancelFunc
 	var live *liveRun
 	liveStore := s.liveStore()
+	rebuildFromFullHistory := func(reason string) {
+		dlog("chat/completions: live continuation failed (%v); rebuild from full client history", reason)
+		if live != nil && conv != nil {
+			liveStore.Remove(conv.ID, live)
+		}
+		if conv != nil {
+			s.conversations.DeleteConversation(ns, conv.ID)
+		}
+		opts = coldOpts
+		ensureConversationID(&opts)
+		conv, live, run, results = nil, nil, nil, nil
+	}
 	if conv != nil {
 		live = liveStore.Get(conv.ID)
 		if live != nil {
-			if err := live.respond(results); err != nil {
-				writeError(w, http.StatusConflict, err.Error(), "api_error")
-				return
+			if err := live.respond(ctx, results); err != nil {
+				rebuildFromFullHistory(err.Error())
+			} else {
+				run = live.currentRun()
+				if run == nil {
+					rebuildFromFullHistory("live Cursor run is no longer available")
+				} else {
+					// Results were submitted directly to the paused bidi stream.
+					results = nil
+				}
 			}
-			run = live.currentRun()
-			if run == nil {
-				writeError(w, http.StatusConflict, "live Cursor run is no longer available", "api_error")
-				return
-			}
-			// Results were submitted directly to the paused bidi stream.
-			results = nil
 		}
 	}
 	if run == nil {
@@ -386,6 +399,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		if live != nil {
 			liveStore.Remove(opts.ConversationID, live)
+			if conv != nil && res.err != nil {
+				s.conversations.DeleteConversation(ns, conv.ID)
+			}
 		} else {
 			if runCancel != nil {
 				runCancel()
