@@ -399,14 +399,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		if live != nil {
 			liveStore.Remove(opts.ConversationID, live)
-			if conv != nil && res.err != nil {
-				s.conversations.DeleteConversation(ns, conv.ID)
-			}
 		} else {
 			if runCancel != nil {
 				runCancel()
 			}
 			run.Close()
+		}
+		// A zero-event upstream turn can indicate a stale Cursor checkpoint.
+		// Drop only that cached conversation so a retry with the same client
+		// history falls back to a cold start.
+		if conv != nil && res.err != nil && (live != nil || isEmptyTurnError(res.err)) {
+			s.conversations.DeleteConversation(ns, conv.ID)
 		}
 	}
 }

@@ -444,9 +444,25 @@ func (res *turnResult) appendToolCall(ev cursor.Event) PendingTool {
 // stallTimeout 无任何服务端事件的最大等待（上游杀 run 不给错误帧时的兜底）。
 const stallTimeout = 120 * time.Second
 
-// errEmptyTurn 上游正常结束但零输出（模型不可用 / run 被拒）。
+// emptyTurnError marks an upstream run that ended without any usable event.
+// Besides making the client-facing error useful, the concrete type lets the
+// handlers invalidate a possibly stale local checkpoint without deleting a
+// conversation for unrelated request failures.
+type emptyTurnError struct {
+	model string
+}
+
+func (e emptyTurnError) Error() string {
+	return fmt.Sprintf("cursor: empty response (model %q unavailable on this account, or run rejected upstream)", e.model)
+}
+
 func errEmptyTurn(model string) error {
-	return fmt.Errorf("cursor: empty response (model %q unavailable on this account, or run rejected upstream)", model)
+	return emptyTurnError{model: model}
+}
+
+func isEmptyTurnError(err error) bool {
+	var target emptyTurnError
+	return errors.As(err, &target)
 }
 
 // errClientWrite 客户端连接写入失败（断连）。
@@ -781,14 +797,17 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	} else {
 		if live != nil {
 			liveStore.Remove(opts.ConversationID, live)
-			if conv != nil && res.err != nil {
-				s.conversations.DeleteConversation(ns, conv.ID)
-			}
 		} else {
 			if runCancel != nil {
 				runCancel()
 			}
 			run.Close()
+		}
+		// An empty upstream turn commonly means Cursor rejected a stale
+		// checkpoint. Forget only that checkpoint so the next client retry with
+		// the same history starts cold; preserve it for ordinary errors/timeouts.
+		if conv != nil && res.err != nil && (live != nil || isEmptyTurnError(res.err)) {
+			s.conversations.DeleteConversation(ns, conv.ID)
 		}
 	}
 }

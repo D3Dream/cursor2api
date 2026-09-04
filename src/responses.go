@@ -21,6 +21,10 @@ type responseSession struct {
 	NS       string
 	Messages []ChatMessage // bounded to keep response-session memory predictable
 	LastUsed time.Time
+	// ForceCold is set when Cursor ends a continuation without producing any
+	// usable event. The next request may still reference this response id, so
+	// retain its bounded history but do not reuse the rejected checkpoint.
+	ForceCold bool
 }
 
 const maxResponseHistoryMessages = 512
@@ -196,6 +200,21 @@ func (s *Server) responseSessionPut(id string, value responseSession) {
 	s.responses[id] = value
 }
 
+func (s *Server) responseSessionForceCold(id string) {
+	if id == "" {
+		return
+	}
+	s.responsesMu.Lock()
+	defer s.responsesMu.Unlock()
+	v, ok := s.responses[id]
+	if !ok {
+		return
+	}
+	v.ForceCold = true
+	v.LastUsed = time.Now()
+	s.responses[id] = v
+}
+
 func newResponseID() string { return "resp_" + randHex12() }
 
 func responseHistory(base, current []ChatMessage, res turnResult) []ChatMessage {
@@ -327,16 +346,27 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		fullMessages := append(append([]ChatMessage(nil), baseHistory...), chatReq.Messages...)
 		coldChatReq := *chatReq
 		coldChatReq.Messages = fullMessages
-		if rebuilt, rebuildErr := openAIToRunOptions(&coldChatReq, model, s.cfg.CursorMode); rebuildErr == nil {
+		rebuilt, rebuildErr := openAIToRunOptions(&coldChatReq, model, s.cfg.CursorMode)
+		if rebuildErr == nil {
 			coldOpts = rebuilt
 			if len(chatReq.Messages) == 0 || chatReq.Messages[len(chatReq.Messages)-1].Role != "user" {
 				coldOpts.Prompt = "(continue)"
 			}
 		}
-		results = responseResults(chatReq.Messages, conv.PendingTools)
-		opts.ConversationID, opts.State, opts.History = conv.ID, conv.Checkpoint, nil
-		if len(results) > 0 {
-			opts.Prompt = ""
+		if session.ForceCold {
+			if rebuildErr != nil {
+				writeError(w, http.StatusBadRequest, rebuildErr.Error(), "invalid_request_error")
+				return
+			}
+			dlog("responses: previous response %s has a rejected checkpoint; rebuild cold", req.PreviousResponse)
+			opts = coldOpts
+			conv = nil
+		} else {
+			results = responseResults(chatReq.Messages, conv.PendingTools)
+			opts.ConversationID, opts.State, opts.History = conv.ID, conv.Checkpoint, nil
+			if len(results) > 0 {
+				opts.Prompt = ""
+			}
 		}
 	}
 	ensureConversationID(&opts)
@@ -429,6 +459,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		if res.err == nil {
 			s.saveResponseSession(id, res, opts, conv, ns, append(append([]ChatMessage(nil), baseHistory...), chatReq.Messages...))
+		}
+		if conv != nil && isEmptyTurnError(res.err) {
+			// Preserve the previous response's bounded message history, but make
+			// its next continuation rebuild without the rejected checkpoint.
+			s.conversations.DeleteConversation(ns, conv.ID)
+			s.responseSessionForceCold(req.PreviousResponse)
 		}
 	}
 }
