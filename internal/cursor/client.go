@@ -174,6 +174,7 @@ type Run struct {
 	execSem   chan struct{} // 异步 exec 并发上限（防上游异常推送打爆 goroutine/子进程）
 	closeOnce sync.Once
 	respBody  io.Closer
+	scripted  bool // 测试用:无 pipe/上游连接,Close 跳过网络清理
 }
 
 // maxConcurrentExec 同一 run 内异步执行的工具调用上限。
@@ -662,6 +663,9 @@ func (r *Run) respondShellStream(execID uint32, resultText string, isError bool)
 func (r *Run) Close() {
 	r.closeOnce.Do(func() {
 		close(r.closeCh)
+		if r.scripted {
+			return
+		}
 		_ = r.pw.Close()
 		if r.respBody != nil {
 			_ = r.respBody.Close()

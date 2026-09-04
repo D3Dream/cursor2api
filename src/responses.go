@@ -474,13 +474,18 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, run
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
 	var wmu sync.Mutex
-	send := func(event string, payload any) bool {
+	var seq int
+	// send emits one SSE event. Codex orders events by sequence_number, so every
+	// payload gets a monotonic value injected here (callers omit it).
+	send := func(event string, payload map[string]any) bool {
+		wmu.Lock()
+		defer wmu.Unlock()
+		payload["sequence_number"] = seq
+		seq++
 		b, err := json.Marshal(payload)
 		if err != nil {
 			return false
 		}
-		wmu.Lock()
-		defer wmu.Unlock()
 		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if _, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b); err != nil {
 			return false
@@ -516,15 +521,56 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, run
 	}()
 	created := time.Now().Unix()
 	send("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "created_at": created, "status": "in_progress", "model": req.Model, "output": []any{}}})
-	toolIndex := 0
-	res := s.runTurn(ctx, run, results, func(ev cursor.Event) bool {
+
+	// Codex keys every streamed part on (output_index, item_id) and only appends
+	// deltas into a buffer it opened via response.output_item.added. A bare
+	// output_text.delta with no announced item is silently dropped — that is why
+	// plain-text replies never render. Track a single running output_index and
+	// lazily open/close a message item around text deltas.
+	outputIndex := 0
+	textItemID := ""       // non-empty while a message item is open
+	textOpen := false
+	openTextItem := func() bool {
+		if textOpen {
+			return true
+		}
+		textItemID = "msg_" + randHex12()
+		ok := send("response.output_item.added", map[string]any{"type": "response.output_item.added", "response_id": id, "output_index": outputIndex, "item": map[string]any{"type": "message", "id": textItemID, "status": "in_progress", "role": "assistant", "content": []any{}}}) &&
+			send("response.content_part.added", map[string]any{"type": "response.content_part.added", "response_id": id, "item_id": textItemID, "output_index": outputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}})
+		textOpen = ok
+		return ok
+	}
+	closeTextItem := func(text string) bool {
+		if !textOpen {
+			return true
+		}
+		itemID := textItemID
+		idx := outputIndex
+		textOpen = false
+		textItemID = ""
+		outputIndex++
+		return send("response.output_text.done", map[string]any{"type": "response.output_text.done", "response_id": id, "item_id": itemID, "output_index": idx, "content_index": 0, "text": text}) &&
+			send("response.content_part.done", map[string]any{"type": "response.content_part.done", "response_id": id, "item_id": itemID, "output_index": idx, "content_index": 0, "part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}) &&
+			send("response.output_item.done", map[string]any{"type": "response.output_item.done", "response_id": id, "output_index": idx, "item": map[string]any{"type": "message", "id": itemID, "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}})
+	}
+
+	var res turnResult
+	res = s.runTurn(ctx, run, results, func(ev cursor.Event) bool {
 		switch ev.Kind {
 		case cursor.EventText:
-			return send("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "delta": ev.Text, "response_id": id, "output_index": 0, "content_index": 0})
+			if !openTextItem() {
+				return false
+			}
+			return send("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "delta": ev.Text, "response_id": id, "item_id": textItemID, "output_index": outputIndex, "content_index": 0})
 		case cursor.EventToolCall:
+			// A function_call is a distinct output item; close any open text item
+			// first so indices stay contiguous and the message is finalized.
+			if !closeTextItem(res.text.String()) {
+				return false
+			}
 			itemID := "fc_" + randHex12()
-			idx := toolIndex
-			toolIndex++
+			idx := outputIndex
+			outputIndex++
 			return send("response.output_item.added", map[string]any{"type": "response.output_item.added", "response_id": id, "output_index": idx, "item": map[string]any{"type": "function_call", "id": itemID, "call_id": ev.ToolCallID, "name": ev.ToolName, "arguments": "", "status": "in_progress"}}) &&
 				send("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "delta": ev.ToolArgsJSON, "response_id": id, "item_id": itemID, "output_index": idx}) &&
 				send("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "arguments": ev.ToolArgsJSON, "response_id": id, "item_id": itemID, "output_index": idx}) &&
@@ -535,7 +581,9 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, run
 	if res.err == nil && res.text.Len() == 0 && len(res.toolCalls) == 0 {
 		res.err = errEmptyTurn(opts.Model)
 	}
+	// Close a still-open text item (turn ended with only text) before completion.
 	if res.err == nil {
+		closeTextItem(res.text.String())
 		send("response.completed", map[string]any{"type": "response.completed", "response": responseOutput(id, req.Model, res, created)})
 	} else {
 		send("error", map[string]any{"type": "error", "error": map[string]any{"message": res.err.Error(), "type": "api_error"}})
