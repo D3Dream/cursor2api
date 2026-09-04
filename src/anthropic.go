@@ -803,10 +803,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 			run.Close()
 		}
-		// An empty upstream turn commonly means Cursor rejected a stale
-		// checkpoint. Forget only that checkpoint so the next client retry with
-		// the same history starts cold; preserve it for ordinary errors/timeouts.
-		if conv != nil && res.err != nil && (live != nil || isEmptyTurnError(res.err)) {
+		// Any upstream failure while continuing a saved conversation can leave
+		// its checkpoint unusable. Forget that checkpoint so the next client
+		// retry with the same history starts cold. A fresh conversation has no
+		// cached state to invalidate.
+		if conv != nil && res.err != nil {
 			s.conversations.DeleteConversation(ns, conv.ID)
 		}
 	}

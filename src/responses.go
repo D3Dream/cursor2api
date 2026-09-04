@@ -460,7 +460,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		if res.err == nil {
 			s.saveResponseSession(id, res, opts, conv, ns, append(append([]ChatMessage(nil), baseHistory...), chatReq.Messages...))
 		}
-		if conv != nil && isEmptyTurnError(res.err) {
+		if conv != nil && res.err != nil {
 			// Preserve the previous response's bounded message history, but make
 			// its next continuation rebuild without the rejected checkpoint.
 			s.conversations.DeleteConversation(ns, conv.ID)

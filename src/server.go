@@ -405,10 +405,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			run.Close()
 		}
-		// A zero-event upstream turn can indicate a stale Cursor checkpoint.
-		// Drop only that cached conversation so a retry with the same client
-		// history falls back to a cold start.
-		if conv != nil && res.err != nil && (live != nil || isEmptyTurnError(res.err)) {
+		// Any upstream failure while continuing a saved conversation can leave
+		// its checkpoint unusable. Drop that cached conversation so a retry with
+		// the same client history falls back to a cold start.
+		if conv != nil && res.err != nil {
 			s.conversations.DeleteConversation(ns, conv.ID)
 		}
 	}
