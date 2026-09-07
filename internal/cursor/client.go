@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -36,9 +37,80 @@ type EventKind int
 // debug 诊断日志开关（CURSOR2API_DEBUG=1）。
 var debug = os.Getenv("CURSOR2API_DEBUG") != ""
 
+// dumpCursor records readable frame summaries and decoded protobuf JSON. It
+// can contain prompts, model output and tool/file contents, so it stays behind
+// a separate explicit switch instead of ordinary debug logs.
+var dumpCursor = os.Getenv("CURSOR2API_DUMP_CURSOR") != ""
+
+// dumpCursorRaw additionally records exact binary frames as Base64. Raw blob
+// and checkpoint frames can be huge, so protocol forensics must opt in again.
+var dumpCursorRaw = os.Getenv("CURSOR2API_DUMP_CURSOR_RAW") != ""
+
 func dlog(format string, args ...any) {
 	if debug {
 		log.Printf("[cursor] "+format, args...)
+	}
+}
+
+func dumpCursorPayload(kind string, flags byte, data []byte) {
+	if !dumpCursorRaw {
+		return
+	}
+	log.Printf("[cursor-raw] kind=%s flags=0x%02x bytes=%d payload_base64=%s",
+		kind, flags, len(data), base64.StdEncoding.EncodeToString(data))
+}
+
+const dumpMaxStringBytes = 4096
+
+// readableProtoMessage converts a dynamic protobuf message into diagnostic
+// JSON without dumping opaque byte blobs. Long strings (prompts, embedded
+// histories) are bounded while short error/status strings remain intact.
+func readableProtoMessage(msg protoreflect.Message) map[string]any {
+	out := make(map[string]any)
+	msg.Range(func(fd protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		name := string(fd.Name())
+		switch {
+		case fd.IsList():
+			list := value.List()
+			items := make([]any, 0, list.Len())
+			for i := 0; i < list.Len(); i++ {
+				items = append(items, readableProtoValue(fd, list.Get(i)))
+			}
+			out[name] = items
+		case fd.IsMap():
+			items := make(map[string]any)
+			value.Map().Range(func(key protoreflect.MapKey, item protoreflect.Value) bool {
+				items[fmt.Sprint(key.Interface())] = readableProtoValue(fd.MapValue(), item)
+				return true
+			})
+			out[name] = items
+		default:
+			out[name] = readableProtoValue(fd, value)
+		}
+		return true
+	})
+	return out
+}
+
+func readableProtoValue(fd protoreflect.FieldDescriptor, value protoreflect.Value) any {
+	switch fd.Kind() {
+	case protoreflect.MessageKind, protoreflect.GroupKind:
+		return readableProtoMessage(value.Message())
+	case protoreflect.BytesKind:
+		return fmt.Sprintf("<bytes:%d omitted>", len(value.Bytes()))
+	case protoreflect.StringKind:
+		s := value.String()
+		if len(s) > dumpMaxStringBytes {
+			return s[:dumpMaxStringBytes] + fmt.Sprintf("...<%d bytes omitted>", len(s)-dumpMaxStringBytes)
+		}
+		return s
+	case protoreflect.EnumKind:
+		if enumValue := fd.Enum().Values().ByNumber(value.Enum()); enumValue != nil {
+			return string(enumValue.Name())
+		}
+		return int32(value.Enum())
+	default:
+		return value.Interface()
 	}
 }
 
@@ -57,6 +129,13 @@ const maxFrameSize = 64 << 20
 
 // maxDecompressedFrameSize gzip 解压后上限（zip bomb 防御，正常解压帧远小于此）。
 const maxDecompressedFrameSize = 256 << 20
+
+// Connect streaming envelope flags. The protocol uses bit 0 for compression
+// and bit 1 for the JSON EndStream envelope.
+const (
+	connectFlagCompressed byte = 0x01
+	connectFlagEndStream  byte = 0x02
+)
 
 // maxShellTimeoutMs shell 执行超时钳制上限。
 // 必须低于调用方 runTurn 的 120s 停滞兜底：超时帧要先于 stall 判定到达，
@@ -393,9 +472,21 @@ func (c *Client) runAttempt(ctx context.Context, r *Run, acm proto.Message) (*ht
 		return nil, fmt.Errorf("connect: %w", err)
 	case resp := <-respCh:
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			bodyLimit := int64(4096)
+			if dumpCursor {
+				bodyLimit = 1 << 20
+			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, bodyLimit))
 			resp.Body.Close()
 			_ = pw.Close()
+			if dumpCursor {
+				log.Printf("[cursor-dump] kind=http_error status=%q headers=%q body_bytes=%d body_text=%q",
+					resp.Status, resp.Header, len(body), body)
+			}
+			if dumpCursorRaw {
+				log.Printf("[cursor-raw] kind=http_error body_bytes=%d body_base64=%s",
+					len(body), base64.StdEncoding.EncodeToString(body))
+			}
 			if resp.StatusCode == http.StatusUnauthorized {
 				// token 过期：作废缓存，重试时会强制重取
 				c.tokens.Invalidate()
@@ -763,18 +854,14 @@ func (r *Run) readLoop(body io.Reader) {
 			r.emit(Event{Kind: EventError, Err: fmt.Errorf("read frame: %w", err)})
 			return
 		}
-		if flags&0x80 != 0 {
-			// EndStream frame（JSON，可能含错误）
-			if len(data) > 2 && !bytes.Equal(data, []byte("{}")) {
-				dlog("readLoop: EndStream with payload: %s", data)
-				r.emit(Event{Kind: EventError, Err: fmt.Errorf("stream end: %s", data)})
-			} else {
-				dlog("readLoop: EndStream (clean)")
-				r.emit(Event{Kind: EventDone})
-			}
-			return
+		// Record the exact bytes as received, before gzip decompression or
+		// EndStream handling. Base64 keeps arbitrary protobuf bytes lossless.
+		dumpCursorPayload("wire_frame", flags, data)
+		if dumpCursor {
+			log.Printf("[cursor-dump] kind=frame flags=0x%02x bytes=%d compressed=%t end_stream=%t",
+				flags, len(data), flags&connectFlagCompressed != 0, flags&connectFlagEndStream != 0)
 		}
-		if flags&0x01 != 0 {
+		if flags&connectFlagCompressed != 0 {
 			gz, err := gzip.NewReader(bytes.NewReader(data))
 			if err != nil {
 				dlog("readLoop: drop frame (%dB): gzip init: %v", l, err)
@@ -787,11 +874,40 @@ func (r *Run) readLoop(body io.Reader) {
 				dlog("readLoop: drop frame (%dB): gunzip: %v", l, err)
 				continue
 			}
+			dumpCursorPayload("decompressed_frame", flags, data)
+			if dumpCursor {
+				log.Printf("[cursor-dump] kind=decompressed_frame bytes=%d", len(data))
+			}
+		}
+		if flags&connectFlagEndStream != 0 {
+			// EndStream frame（JSON，可能含错误）。压缩标志可以和结束标志
+			// 同时出现（0x03），因此必须在解压之后解释 payload。
+			trimmed := bytes.TrimSpace(data)
+			if len(trimmed) != 0 && !bytes.Equal(trimmed, []byte("{}")) {
+				if dumpCursor {
+					log.Printf("[cursor-dump] kind=end_stream_error payload=%q", data)
+				}
+				dlog("readLoop: EndStream with payload: %q", data)
+				// Keep the decompressed upstream payload byte-for-byte in Error().
+				// API adapters place it in their protocol-native error.message field.
+				r.emit(Event{Kind: EventError, Err: errors.New(string(data))})
+			} else {
+				dlog("readLoop: EndStream (clean)")
+				r.emit(Event{Kind: EventDone})
+			}
+			return
 		}
 		msg, err := r.reg.Unmarshal("agent.v1.AgentServerMessage", data)
 		if err != nil {
 			dlog("readLoop: drop frame (%dB): unmarshal: %v", len(data), err)
 			continue
+		}
+		if dumpCursor {
+			if decoded, marshalErr := json.Marshal(readableProtoMessage(msg.ProtoReflect())); marshalErr != nil {
+				log.Printf("[cursor-dump] kind=decoded_message_error error=%q", marshalErr)
+			} else {
+				log.Printf("[cursor-dump] kind=decoded_message json=%s", decoded)
+			}
 		}
 		r.handle(msg)
 	}
