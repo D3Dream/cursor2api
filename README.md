@@ -22,6 +22,8 @@ Claude Code / Codex -> sub2api -> cursor2api (Docker internal network) -> Cursor
 
 Windows and Linux cannot read tokens from the macOS Keychain. Provide the token through an environment variable:
 
+On Windows, see [Get a Cursor Access Token from the local Cursor database](GET_CURSOR_ACCESS_TOKEN_WINDOWS.md) (Chinese) for DB Browser for SQLite instructions.
+
 ~~~powershell
 $env:CURSOR_ACCESS_TOKEN = "your-Cursor-token"
 ~~~

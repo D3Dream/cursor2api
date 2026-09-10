@@ -46,6 +46,9 @@ Cursor Agent 后端
 
 Windows/Linux 无法从 macOS Keychain 读取 token，需要通过环境变量提供：
 
+Windows 用户可参照 [Windows 获取 Cursor Access Token](GET_CURSOR_ACCESS_TOKEN_WINDOWS.md)，
+使用 DB Browser for SQLite 从当前已登录的 Cursor 客户端状态数据库中读取 token。
+
 ```powershell
 $env:CURSOR_ACCESS_TOKEN = "你的-Cursor-Token"
 ```
