@@ -369,6 +369,6 @@ main() {
   log "Manage: cursor2api-manager status|logs|update|token|restart|uninstall"
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${CURSOR2API_SOURCE_ONLY:-0}" != "1" ]]; then
   main "$@"
 fi

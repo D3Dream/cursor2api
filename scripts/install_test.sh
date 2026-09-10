@@ -21,6 +21,7 @@ assert_not_contains() {
 }
 
 test_installer_files() (
+  CURSOR2API_SOURCE_ONLY=1
   # shellcheck source=install.sh
   source "${SCRIPT_DIR}/install.sh"
   local root
@@ -62,6 +63,7 @@ test_installer_files() (
 )
 
 test_manager_metadata() (
+  CURSOR2API_SOURCE_ONLY=1
   # shellcheck source=cursor2api-manager
   source "${SCRIPT_DIR}/cursor2api-manager"
   local root
