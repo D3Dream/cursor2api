@@ -1,0 +1,5 @@
+*.sh text eol=lf
+scripts/cursor2api-manager text eol=lf
+Dockerfile* text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

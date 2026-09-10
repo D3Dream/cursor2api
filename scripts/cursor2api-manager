@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO="D3Dream/cursor2api"
+RELEASES_URL="https://github.com/${REPO}/releases"
+GHCR_IMAGE="ghcr.io/d3dream/cursor2api"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+INSTALL_DIR="$(dirname "$SCRIPT_PATH")"
+COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
+METADATA_FILE="${INSTALL_DIR}/.env"
+TOKEN_FILE="${INSTALL_DIR}/.env.cursor2api"
+CONTAINER_NAME="cursor2api"
+TMP_DIR=""
+
+log() { printf '[cursor2api] %s\n' "$*"; }
+warn() { printf '[cursor2api] WARNING: %s\n' "$*" >&2; }
+die() { printf '[cursor2api] ERROR: %s\n' "$*" >&2; exit 1; }
+
+cleanup() {
+  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT
+
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "Run with sudo: sudo cursor2api-manager $*"
+}
+
+require_installation() {
+  [[ -f "$COMPOSE_FILE" && -f "$METADATA_FILE" ]] || die "Installation not found in ${INSTALL_DIR}"
+  # This file is created by the root-only installer and contains constrained values.
+  # shellcheck disable=SC1090
+  source "$METADATA_FILE"
+  : "${CURSOR2API_IMAGE:?Missing CURSOR2API_IMAGE in .env}"
+  : "${CURSOR2API_VERSION:?Missing CURSOR2API_VERSION in .env}"
+  : "${CURSOR2API_NETWORK:?Missing CURSOR2API_NETWORK in .env}"
+}
+
+compose() {
+  docker compose --project-directory "$INSTALL_DIR" -f "$COMPOSE_FILE" "$@"
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    *) die "Unsupported architecture: $(uname -m)" ;;
+  esac
+}
+
+latest_version() {
+  local final_url
+  final_url="$(curl -fsSL --connect-timeout 5 --max-time 20 -o /dev/null -w '%{url_effective}' "${RELEASES_URL}/latest")" || return 1
+  LATEST_VERSION="${final_url##*/}"
+  [[ "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+}
+
+write_runtime_dockerfile() {
+  cat >"${INSTALL_DIR}/runtime/Dockerfile" <<'EOF'
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --no-create-home cursor2api
+WORKDIR /app
+COPY cursor2api /app/cursor2api
+COPY schema /app/schema
+RUN chmod 0755 /app/cursor2api
+USER 10001:10001
+EXPOSE 3010
+ENTRYPOINT ["/app/cursor2api", "/app/config.json"]
+EOF
+}
+
+build_release_image() {
+  local version="$1"
+  local asset="cursor2api_v${version}_linux_${ARCH}"
+  local archive="${asset}.tar.gz"
+  local download_base="${RELEASES_URL}/download/${version}"
+
+  TMP_DIR="$(mktemp -d)"
+  curl -fL --connect-timeout 5 --max-time 180 --retry 2 -o "${TMP_DIR}/${archive}" "${download_base}/${archive}" || \
+    die "No ${ARCH} release asset is available for ${version}"
+  curl -fL --connect-timeout 5 --max-time 30 --retry 2 -o "${TMP_DIR}/${archive}.sha256" "${download_base}/${archive}.sha256" || \
+    die "Release checksum is unavailable"
+
+  local expected actual
+  expected="$(awk 'NR == 1 { print $1 }' "${TMP_DIR}/${archive}.sha256")"
+  actual="$(sha256sum "${TMP_DIR}/${archive}" | awk '{ print $1 }')"
+  [[ -n "$expected" && "${expected,,}" == "${actual,,}" ]] || die "SHA-256 verification failed"
+  tar -xzf "${TMP_DIR}/${archive}" -C "$TMP_DIR"
+
+  local extracted="${TMP_DIR}/${asset}"
+  mkdir -p "${INSTALL_DIR}/runtime/schema"
+  install -m 0755 "${extracted}/cursor2api" "${INSTALL_DIR}/runtime/cursor2api"
+  install -m 0644 "${extracted}/schema/cursor_fds.json" "${INSTALL_DIR}/runtime/schema/cursor_fds.json"
+  write_runtime_dockerfile
+  NEW_IMAGE="cursor2api:local-${version}"
+  docker build --pull -t "$NEW_IMAGE" "${INSTALL_DIR}/runtime"
+}
+
+set_metadata_value() {
+  local key="$1" value="$2" tmp="${METADATA_FILE}.tmp"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { found = 0 }
+    index($0, key "=") == 1 { print key "=" value; found = 1; next }
+    { print }
+    END { if (!found) print key "=" value }
+  ' "$METADATA_FILE" >"$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$METADATA_FILE"
+}
+
+wait_for_health() {
+  local status=""
+  for _ in $(seq 1 45); do
+    status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+    case "$status" in
+      healthy|running) log "Container status: ${status}"; return 0 ;;
+      unhealthy|exited|dead) break ;;
+    esac
+    sleep 1
+  done
+  compose logs --tail=100 cursor2api || true
+  die "Container did not become healthy (status: ${status:-unknown})"
+}
+
+cmd_status() {
+  require_root status
+  require_installation
+  compose ps
+  local status
+  status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+  log "Installed version: ${CURSOR2API_VERSION}"
+  log "Container status: ${status:-not found}"
+  if [[ "${CURSOR2API_LOCAL_ONLY:-0}" == "1" ]]; then
+    log "Local URL: http://127.0.0.1:${CURSOR2API_HOST_PORT:-3010}/v1"
+  else
+    log "Docker URL: http://cursor2api:3010/v1 (${CURSOR2API_NETWORK})"
+  fi
+}
+
+cmd_logs() {
+  require_root logs
+  require_installation
+  exec docker compose --project-directory "$INSTALL_DIR" -f "$COMPOSE_FILE" logs -f --tail="${CURSOR2API_LOG_TAIL:-100}" cursor2api
+}
+
+cmd_restart() {
+  require_root restart
+  require_installation
+  compose up -d --no-build --force-recreate
+  wait_for_health
+}
+
+cmd_token() {
+  require_root token
+  require_installation
+  local token="${CURSOR_ACCESS_TOKEN:-}"
+  if [[ -z "$token" ]]; then
+    [[ -r /dev/tty ]] || die "No interactive terminal. Set CURSOR_ACCESS_TOKEN before running this command."
+    printf 'New Cursor Access Token: ' >/dev/tty
+    IFS= read -r -s token </dev/tty
+    printf '\n' >/dev/tty
+  fi
+  [[ -n "$token" ]] || die "Cursor Access Token cannot be empty"
+  [[ "$token" != *$'\n'* && "$token" != *$'\r'* ]] || die "Cursor Access Token must be a single line"
+  [[ "$token" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || die "Cursor Access Token contains characters that are unsafe in a Docker env file"
+  local tmp="${TOKEN_FILE}.tmp"
+  printf 'CURSOR_ACCESS_TOKEN=%s\n' "$token" >"$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$TOKEN_FILE"
+  compose up -d --no-build --force-recreate
+  wait_for_health
+  log "Cursor Access Token updated."
+}
+
+cmd_update() {
+  require_root update
+  require_installation
+  detect_arch
+  latest_version || die "Unable to determine the latest GitHub Release"
+  log "Installed: ${CURSOR2API_VERSION}; latest: ${LATEST_VERSION}"
+
+  NEW_IMAGE="${GHCR_IMAGE}:${LATEST_VERSION}"
+  if ! docker pull "$NEW_IMAGE"; then
+    if [[ "$LATEST_VERSION" == "$CURSOR2API_VERSION" && "$CURSOR2API_IMAGE" == cursor2api:local-* ]]; then
+      log "Already running the latest release; GHCR image is not available."
+      return 0
+    fi
+    warn "GHCR image is unavailable; using the verified GitHub Release binary."
+    build_release_image "$LATEST_VERSION"
+  fi
+
+  set_metadata_value CURSOR2API_IMAGE "$NEW_IMAGE"
+  set_metadata_value CURSOR2API_VERSION "$LATEST_VERSION"
+  compose up -d --no-build --force-recreate
+  wait_for_health
+
+  local manager_tmp="${INSTALL_DIR}/cursor2api-manager.new"
+  if curl -fL --connect-timeout 5 --max-time 30 --retry 2 -o "$manager_tmp" \
+    "https://raw.githubusercontent.com/${REPO}/${LATEST_VERSION}/scripts/cursor2api-manager"; then
+    chmod 0755 "$manager_tmp"
+    mv -f "$manager_tmp" "${INSTALL_DIR}/cursor2api-manager"
+  else
+    rm -f -- "$manager_tmp"
+    warn "Service updated, but the tagged manager script could not update itself."
+  fi
+  log "Updated to ${LATEST_VERSION}."
+}
+
+cmd_uninstall() {
+  require_root uninstall
+  require_installation
+  [[ "$INSTALL_DIR" == /opt/* && "$INSTALL_DIR" != "/opt" ]] || die "Refusing to remove unexpected install directory: ${INSTALL_DIR}"
+  if [[ -r /dev/tty ]]; then
+    printf 'Type REMOVE to uninstall cursor2api and delete %s: ' "$INSTALL_DIR" >/dev/tty
+    local answer
+    IFS= read -r answer </dev/tty
+    [[ "$answer" == "REMOVE" ]] || die "Uninstall cancelled"
+  else
+    die "Uninstall requires an interactive terminal"
+  fi
+  compose down --remove-orphans
+  rm -f -- /usr/local/bin/cursor2api-manager
+  rm -rf -- "$INSTALL_DIR"
+  log "Uninstalled. The external Docker network was not removed."
+}
+
+usage() {
+  cat <<'EOF'
+Usage: cursor2api-manager <command>
+
+Commands:
+  status     Show container and installed version
+  logs       Follow service logs
+  update     Install the latest GitHub Release
+  token      Replace the Cursor Access Token and restart
+  restart    Recreate and health-check the container
+  uninstall  Remove the container and installation files
+EOF
+}
+
+main() {
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed"
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+  case "${1:-}" in
+    status) cmd_status ;;
+    logs) cmd_logs ;;
+    update) cmd_update ;;
+    token) cmd_token ;;
+    restart) cmd_restart ;;
+    uninstall) cmd_uninstall ;;
+    help|-h|--help|"") usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

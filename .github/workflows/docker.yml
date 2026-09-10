@@ -1,0 +1,115 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Test installer
+        run: |
+          bash -n scripts/install.sh scripts/cursor2api-manager scripts/install_test.sh
+          bash scripts/install_test.sh
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/d3dream/cursor2api
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release-assets:
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check installer syntax
+        run: bash -n scripts/install.sh scripts/cursor2api-manager
+
+      - name: Test installer file generation
+        run: bash scripts/install_test.sh
+
+      - name: Build release assets
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist
+
+          for arch in amd64 arm64; do
+            name="cursor2api_v${VERSION}_linux_${arch}"
+            root="dist/${name}"
+            mkdir -p "${root}/schema"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags="-s -w" -o "${root}/cursor2api" ./src
+            cp schema/cursor_fds.json "${root}/schema/"
+            cp config.docker.example.json "${root}/"
+            cp Dockerfile.prebuilt "${root}/"
+            cp docker-compose.cursor2api.prebuilt.yml "${root}/docker-compose.yml"
+            cp README.md README_zh_cn.md GET_CURSOR_ACCESS_TOKEN_WINDOWS.md "${root}/"
+            tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+            (cd dist && sha256sum "${name}.tar.gz" >"${name}.tar.gz.sha256")
+          done
+
+          windows="dist/cursor2api_v${VERSION}_windows_amd64.exe"
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$windows" ./src
+          zip -j "dist/cursor2api_v${VERSION}_windows_amd64.zip" "$windows"
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release create "$VERSION" --title "$VERSION" --generate-notes
+          fi
+          gh release upload "$VERSION" dist/*.tar.gz dist/*.sha256 dist/*.exe dist/*.zip --clobber

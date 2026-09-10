@@ -14,6 +14,29 @@ The server only translates protocols. Shell, file, grep, and directory tools are
 Claude Code / Codex -> sub2api -> cursor2api (Docker internal network) -> Cursor Agent backend
 ~~~
 
+## One-command VPS installation
+
+On a VPS with Docker and Docker Compose v2 installed, run:
+
+~~~bash
+curl -fsSL https://raw.githubusercontent.com/D3Dream/cursor2api/main/scripts/install.sh | sudo bash
+~~~
+
+The installer securely prompts for the Cursor Access Token, generates a strong cursor2api API key, detects `amd64` or `arm64`, and joins an existing sub2api Docker network when one is found. It does not publish port 3010 in that mode. Without a selected sub2api network, it binds only to `127.0.0.1:3010`.
+
+Manage the installation with:
+
+~~~bash
+sudo cursor2api-manager status
+sudo cursor2api-manager logs
+sudo cursor2api-manager update
+sudo cursor2api-manager token
+sudo cursor2api-manager restart
+sudo cursor2api-manager uninstall
+~~~
+
+Tagged releases publish multi-architecture images as `ghcr.io/d3dream/cursor2api:<version>` and `ghcr.io/d3dream/cursor2api:latest`. If GHCR is unavailable, the installer falls back to the verified prebuilt GitHub Release for the detected architecture.
+
 ## 1. Prerequisites
 
 - Go 1.25 or newer
@@ -210,7 +233,7 @@ cat > .env.cursor2api <<'EOF'
 CURSOR_ACCESS_TOKEN=your-Cursor-token
 EOF
 chmod 600 .env.cursor2api
-docker build -f Dockerfile.prebuilt -t cursor2api:linux-amd64 .
+docker build -f Dockerfile.prebuilt -t cursor2api:local .
 docker compose up -d --no-build
 docker compose logs -f cursor2api
 ~~~
@@ -224,7 +247,7 @@ Keep `config.docker.json`, `.env.cursor2api`, and `docker-compose.yml`. Replace 
 ~~~bash
 cd /opt/cursor2api
 chmod +x cursor2api
-docker build -f Dockerfile.prebuilt -t cursor2api:linux-amd64 .
+docker build -f Dockerfile.prebuilt -t cursor2api:local .
 docker compose up -d --force-recreate --no-build
 docker compose logs -f --tail=100 cursor2api
 ~~~
@@ -245,7 +268,7 @@ For a Compose-managed connection, edit `/opt/cursor2api/docker-compose.yml`:
 ~~~yaml
 services:
   cursor2api:
-    image: cursor2api:linux-amd64
+    image: cursor2api:local
     container_name: cursor2api
     restart: unless-stopped
     env_file:

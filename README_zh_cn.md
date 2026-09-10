@@ -36,6 +36,52 @@ cursor2api  Docker 内网服务
 Cursor Agent 后端
 ```
 
+## VPS 一键部署
+
+VPS 已安装 Docker 和 Docker Compose v2 时，执行一条命令即可安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/D3Dream/cursor2api/main/scripts/install.sh | sudo bash
+```
+
+安装器会隐藏输入 Cursor Access Token，自动生成 cursor2api API Key，并执行以下操作：
+
+- 自动识别 Linux `amd64` / `arm64` 架构；
+- 获取最新 GitHub Release，优先拉取对应的 GHCR 镜像；
+- GHCR 暂不可用时，`amd64` 自动下载并校验预编译 Release 后组装镜像；
+- 自动发现 `sub2api` 容器或相关 Docker 网络；
+- 找到 sub2api 网络时只开放 Docker 内网地址，不映射宿主机端口；
+- 未找到时可手动输入网络名，留空则只绑定 `127.0.0.1:3010`；
+- 创建 `/opt/cursor2api` 下的配置并启动、健康检查容器。
+
+安装完成后使用：
+
+```bash
+sudo cursor2api-manager status
+sudo cursor2api-manager logs
+sudo cursor2api-manager update
+sudo cursor2api-manager token
+sudo cursor2api-manager restart
+sudo cursor2api-manager uninstall
+```
+
+重复执行安装命令会保留已有配置和 Cursor token。也可以在执行前设置
+`SUB2API_NETWORK`、`CURSOR2API_HOST_PORT`，用于无人值守环境或自定义本地端口，例如：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/D3Dream/cursor2api/main/scripts/install.sh \
+  | sudo env SUB2API_NETWORK=sub2api-deploy_sub2api-network bash
+```
+
+发布标签会通过 GitHub Actions 构建：
+
+```text
+ghcr.io/d3dream/cursor2api:<版本号>
+ghcr.io/d3dream/cursor2api:latest
+```
+
+首次发布 GHCR 包后，请在 GitHub Packages 设置中确认该容器包为 Public；否则安装器会回退到公开 Release 包。
+
 ## 1. 准备
 
 需要：
@@ -296,7 +342,7 @@ chmod 600 .env.cursor2api
 ### 5.4 组装镜像并启动
 
 ```bash
-docker build -f Dockerfile.prebuilt -t cursor2api:linux-amd64 .
+docker build -f Dockerfile.prebuilt -t cursor2api:local .
 docker compose up -d --no-build
 ```
 
@@ -324,7 +370,7 @@ docker-compose.yml
 cd /opt/cursor2api
 chmod +x cursor2api
 
-docker build -f Dockerfile.prebuilt -t cursor2api:linux-amd64 .
+docker build -f Dockerfile.prebuilt -t cursor2api:local .
 docker compose up -d --force-recreate --no-build
 docker compose logs -f --tail=100 cursor2api
 ```
@@ -354,7 +400,7 @@ docker inspect sub2api \
 ```yaml
 services:
   cursor2api:
-    image: cursor2api:linux-amd64
+    image: cursor2api:local
     container_name: cursor2api
     restart: unless-stopped
     env_file:

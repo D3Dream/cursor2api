@@ -1,6 +1,6 @@
 services:
   cursor2api:
-    image: cursor2api:linux-amd64
+    image: cursor2api:local
     container_name: cursor2api
     restart: unless-stopped
     env_file:

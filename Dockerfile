@@ -12,7 +12,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --no-create-home cursor2api
 
@@ -22,4 +22,6 @@ COPY schema /app/schema
 USER 10001:10001
 
 EXPOSE 3010
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=5 \
+    CMD curl -fsS http://127.0.0.1:3010/health || exit 1
 ENTRYPOINT ["/app/cursor2api", "/app/config.json"]
