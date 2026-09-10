@@ -14,7 +14,14 @@ The server only translates protocols. Shell, file, grep, and directory tools are
 Claude Code / Codex -> sub2api -> cursor2api (Docker internal network) -> Cursor Agent backend
 ~~~
 
-## One-command VPS installation
+## Deployment options
+
+Choose one deployment method:
+
+- **One-command installation (recommended):** downloads, configures, starts, and health-checks cursor2api on an Ubuntu VPS.
+- **Manual deployment:** for users who need to build locally, run the Linux binary directly, or fully control the Docker configuration.
+
+### One-command installation (recommended)
 
 On a VPS with Docker and Docker Compose v2 installed, run:
 
@@ -35,7 +42,11 @@ sudo cursor2api-manager restart
 sudo cursor2api-manager uninstall
 ~~~
 
-Tagged releases publish multi-architecture images as `ghcr.io/d3dream/cursor2api:<version>` and `ghcr.io/d3dream/cursor2api:latest`. If GHCR is unavailable, the installer falls back to the verified prebuilt GitHub Release for the detected architecture.
+> After the installer completes and its health check passes, cursor2api is ready. **Do not perform the manual deployment steps below.** Continue directly to section 7 only if you need to connect sub2api.
+
+## Manual deployment
+
+Sections 1 through 6 below describe manual deployment: local verification, cross-compilation, direct Linux execution, and manually managed Docker deployment. Skip them after a successful one-command installation.
 
 ## 1. Prerequisites
 

@@ -13,16 +13,6 @@ cursor2api 把 Cursor Agent 的私有 Connect-RPC 协议转换成常见 AI API�
 
 服务端只做协议中转。Cursor 上游请求的 shell、文件读写、grep、目录枚举等工具调用会返回给下游 Agent，由 Claude Code、Codex 或其他调用方在本地工作区执行；VPS 不执行这些工具。
 
-推荐部署顺序：
-
-1. 先在本机运行 `cursor2api.exe`，确认 token、模型和工具循环都正常。
-2. 再交叉编译 Linux amd64 二进制。
-3. 上传到 Ubuntu VPS，优先用 Docker 运行。
-4. 将 cursor2api 加入 sub2api 的 Docker 网络。
-5. 在 sub2api 中配置为内部上游。
-
-直接运行 Linux 二进制也可以，详见第 4 节；Docker 部署详见第 5 节。
-
 ```text
 Claude Code / Codex
         |
@@ -36,7 +26,14 @@ cursor2api  Docker 内网服务
 Cursor Agent 后端
 ```
 
-## VPS 一键部署
+## 部署方式
+
+部署方式二选一：
+
+- **一键自动部署（推荐）**：适合 Ubuntu VPS，自动完成下载、配置、Docker 启动和健康检查。
+- **手动部署**：适合需要自行编译、直接运行 Linux 二进制或完全控制 Docker 配置的用户。
+
+### 一键自动部署（推荐）
 
 VPS 已安装 Docker 和 Docker Compose v2 时，执行一条命令即可安装：
 
@@ -48,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/D3Dream/cursor2api/main/scripts/ins
 
 - 自动识别 Linux `amd64` / `arm64` 架构；
 - 获取最新 GitHub Release，优先拉取对应的 GHCR 镜像；
-- GHCR 暂不可用时，`amd64` 自动下载并校验预编译 Release 后组装镜像；
+- GHCR 暂不可用时，自动下载并校验当前架构的预编译 Release 后组装镜像；
 - 自动发现 `sub2api` 容器或相关 Docker 网络；
 - 找到 sub2api 网络时只开放 Docker 内网地址，不映射宿主机端口；
 - 未找到时可手动输入网络名，留空则只绑定 `127.0.0.1:3010`；
@@ -73,14 +70,11 @@ curl -fsSL https://raw.githubusercontent.com/D3Dream/cursor2api/main/scripts/ins
   | sudo env SUB2API_NETWORK=sub2api-deploy_sub2api-network bash
 ```
 
-发布标签会通过 GitHub Actions 构建：
+> 一键部署完成并通过健康检查后，cursor2api 已经可以使用，**不需要再执行下面的手动部署步骤**。需要接入 sub2api 时可直接阅读第 7 节。
 
-```text
-ghcr.io/d3dream/cursor2api:<版本号>
-ghcr.io/d3dream/cursor2api:latest
-```
+## 手动部署
 
-首次发布 GHCR 包后，请在 GitHub Packages 设置中确认该容器包为 Public；否则安装器会回退到公开 Release 包。
+以下第 1～6 节是手动部署流程，包含本机验证、交叉编译、Linux 二进制运行和手动 Docker 部署。一键部署成功的用户可以跳过这些章节。
 
 ## 1. 准备
 
