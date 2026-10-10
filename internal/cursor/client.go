@@ -238,6 +238,7 @@ type Run struct {
 	closeCh chan struct{}
 
 	systemPrompt string
+	tools        []ToolDef // 注入的 MCP 工具清单：mcp_state_exec 握手应答需原样上报
 	lastExecID   uint32
 	execIDMu     sync.RWMutex
 
@@ -258,6 +259,11 @@ type Run struct {
 
 // maxConcurrentExec 同一 run 内异步执行的工具调用上限。
 const maxConcurrentExec = 16
+
+// mcpProviderID 注入工具伪装成的 MCP server 标识。服务端据此将工具
+// 归属到该"server"，模型随后会发起 mcp_state_exec 握手确认其状态——
+// 应答里必须使用同一标识（见 replyMcpState）。
+const mcpProviderID = "cursor2api"
 
 // maxBlobCacheBytes 单 run blob 缓存总量上限（长会话状态防无界增长）。
 const maxBlobCacheBytes = 256 << 20
@@ -356,7 +362,7 @@ func (c *Client) Run(ctx context.Context, opts RunOptions) (*Run, error) {
 		setStr(td, "tool_name", t.Name)
 		setStr(td, "description", t.Description)
 		setStr(td, "input_schema_json", t.InputSchema)
-		setStr(td, "provider_identifier", "cursor2api")
+		setStr(td, "provider_identifier", mcpProviderID)
 	}
 	setStr(rr, "conversation_id", opts.ConversationID)
 	setStr(rr, "conversation_group_id", opts.ConversationID)
@@ -377,6 +383,7 @@ func (c *Client) Run(ctx context.Context, opts RunOptions) (*Run, error) {
 		blobs:        make(map[string][]byte),
 		execSem:      make(chan struct{}, maxConcurrentExec),
 		systemPrompt: opts.SystemPrompt,
+		tools:        opts.Tools,
 	}
 	// 续聊：把上一轮带回的 blob 灌入缓存，供 get_blob 应答
 	if opts.State != nil {
@@ -1082,6 +1089,14 @@ func (r *Run) handleExec(esm *dynamicpb.Message) {
 			})
 		case "span_context":
 			// 追踪上下文，无需回包
+		case "mcp_state_exec_args":
+			// MCP 状态握手（元协议，非工作型工具）：模型在调用注入工具前
+			// 先确认 server 状态。必须本地应答，转发下游只会得到
+			// "unavailable tool" 并陷入重试循环（官方 CLI 会直接应答）。
+			r.replyMcpState(execID, execIDStr)
+		case "mcp_allowlist_precheck_args":
+			// MCP 工具预检（元协议）：注入的工具始终允许，本地放行。
+			r.replyMcpAllowlist(execID, execIDStr)
 		case "shell_stream_args":
 			// Forward to the downstream agent. The VPS must never execute shell
 			// commands, including Cursor's streaming shell variant.
@@ -1270,6 +1285,54 @@ func (r *Run) replyExecRejected(execID uint32, execIDStr, name string) {
 		setStr(ecm, "exec_id", execIDStr)
 	}
 	fillExecError(ecm, name, "rejected by cursor2api: unsupported exec "+name)
+	_ = r.send(acm)
+}
+
+// replyMcpState 应答 mcp_state_exec 握手：把注入的 MCP server 上报为
+// ready，并原样携带工具清单（与 Run 请求里 mcp_tools 的注入内容一致）。
+func (r *Run) replyMcpState(execID uint32, execIDStr string) {
+	acm, err := r.reg.New("agent.v1.AgentClientMessage")
+	if err != nil {
+		return
+	}
+	ecm := sub(acm, "exec_client_message")
+	setUint(ecm, "id", execID)
+	if execIDStr != "" {
+		setStr(ecm, "exec_id", execIDStr)
+	}
+	res := sub(ecm, "mcp_state_exec_result")
+	succ := sub(res, "success")
+	srv := appendSub(succ, "servers")
+	setStr(srv, "server_name", mcpProviderID)
+	setStr(srv, "server_identifier", mcpProviderID)
+	if st := srv.Descriptor().Fields().ByName(protoreflect.Name("status")); st != nil && st.Kind() == protoreflect.StringKind {
+		srv.Set(st, protoreflect.ValueOfString("ready"))
+	}
+	for _, t := range r.tools {
+		td := appendSub(srv, "tools")
+		setStr(td, "name", t.Name)
+		setStr(td, "tool_name", t.Name)
+		setStr(td, "description", t.Description)
+		setStr(td, "input_schema_json", t.InputSchema)
+		setStr(td, "provider_identifier", mcpProviderID)
+	}
+	_ = r.send(acm)
+	_ = r.sendStreamClose(0)
+}
+
+// replyMcpAllowlist 应答 mcp_allowlist_precheck：注入的工具全部放行。
+func (r *Run) replyMcpAllowlist(execID uint32, execIDStr string) {
+	acm, err := r.reg.New("agent.v1.AgentClientMessage")
+	if err != nil {
+		return
+	}
+	ecm := sub(acm, "exec_client_message")
+	setUint(ecm, "id", execID)
+	if execIDStr != "" {
+		setStr(ecm, "exec_id", execIDStr)
+	}
+	res := sub(ecm, "mcp_allowlist_precheck_result")
+	setBool(res, "allowlisted", true)
 	_ = r.send(acm)
 }
 
