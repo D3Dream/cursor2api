@@ -25,6 +25,9 @@ type ChatCompletionRequest struct {
 	User          string              `json:"user"`
 	Tools         []openAITool        `json:"tools"`
 	StreamOptions *openAIStreamOption `json:"stream_options"`
+	// ReasoningEffort OpenAI 风格的推理档位参数（low/medium/high/...），
+	// 映射为 Cursor 的档位模型变体（见 Server.applyEffort）。
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // openAITool OpenAI 格式的工具声明。

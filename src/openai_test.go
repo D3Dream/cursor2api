@@ -201,6 +201,30 @@ func TestMapModel(t *testing.T) {
 	}
 }
 
+// applyEffort：档位拼接 > 已带档位不重拼 > -fast 变体保后缀 >
+// 别名/非法值/空直通。
+func TestApplyEffort(t *testing.T) {
+	srv := &Server{cfg: Config{}}
+	cases := []struct{ model, effort, want string }{
+		{"grok-4.7", "high", "grok-4.7-high"},
+		{"cursor-grok-4.6", "xhigh", "cursor-grok-4.6-xhigh"},
+		{"grok-4.7", "", "grok-4.7"},            // 无参数
+		{"grok-4.7", "bogus", "grok-4.7"},       // 非法档位忽略
+		{"grok-4.7-high", "high", "grok-4.7-high"}, // 已带档位不重拼
+		{"grok-4.7-fast", "high", "grok-4.7-high-fast"}, // fast 保后缀
+		{"grok-4.7-high-fast", "high", "grok-4.7-high-fast"},
+		{"gpt-5.4-mini", "none", "gpt-5.4-mini-none"},
+		{"default", "high", "default"}, // 服务端别名不参与
+		{"auto", "high", "auto"},
+		{"", "high", ""},
+	}
+	for _, c := range cases {
+		if got := srv.applyEffort(c.model, c.effort); got != c.want {
+			t.Errorf("applyEffort(%q, %q) = %q, want %q", c.model, c.effort, got, c.want)
+		}
+	}
+}
+
 func mkOpenAIToolCall(id, name, args string) []openAIToolCall {
 	var c openAIToolCall
 	c.ID = id

@@ -37,6 +37,11 @@ type responsesRequest struct {
 	Stream           bool            `json:"stream"`
 	User             string          `json:"user"`
 	PreviousResponse string          `json:"previous_response_id"`
+	// Reasoning Responses API 的推理配置（reasoning.effort），映射为
+	// Cursor 的档位模型变体（见 Server.applyEffort）。
+	Reasoning struct {
+		Effort string `json:"effort,omitempty"`
+	} `json:"reasoning,omitempty"`
 }
 
 type responseTool struct {
@@ -311,7 +316,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json body", "invalid_request_error")
 		return
 	}
-	model := s.mapModel(req.Model)
+	model := s.applyEffort(s.mapModel(req.Model), req.Reasoning.Effort)
 	if err := s.checkModelUsable(model); err != nil {
 		writeError(w, http.StatusNotFound, err.Error(), "invalid_request_error")
 		return

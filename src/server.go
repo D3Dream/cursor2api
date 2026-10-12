@@ -135,6 +135,34 @@ func (s *Server) mapModel(requested string) string {
 	return requested
 }
 
+// applyEffort 将请求级推理档位参数映射为 Cursor 的档位模型变体。
+// Cursor 后端把推理档位编码为独立模型 ID（grok-4.7-high 与 grok-4.7 是两个
+// 模型），而 OpenAI 风格客户端（chat/completions 的 reasoning_effort、
+// responses 的 reasoning.effort）靠请求参数切档。拼接发生在 mapModel 之后，
+// 两层正交：mapModel 做别名归一，effort 做档位展开。已显式带档位后缀的
+// 模型名不重复拼接；-fast 变体保持后缀位置（grok-4.7-fast + high →
+// grok-4.7-high-fast）。default/auto 是服务端别名，不参与。非法档位值
+// 忽略（而非报错），与 mapModel 的宽松直通语义一致。
+func (s *Server) applyEffort(model, effort string) string {
+	if model == "" || model == "default" || model == "auto" {
+		return model
+	}
+	switch effort {
+	case "low", "medium", "high", "xhigh", "max", "minimal", "none":
+	default:
+		return model
+	}
+	fast := strings.HasSuffix(model, "-fast")
+	base := strings.TrimSuffix(model, "-fast")
+	if strings.HasSuffix(base, "-"+effort) {
+		return model
+	}
+	if fast {
+		return base + "-" + effort + "-fast"
+	}
+	return model + "-" + effort
+}
+
 // checkModelUsable 缓存非空时校验模型可用性，不可用则给出可用列表的错误信息。
 // default/auto 是服务端别名，不参与校验；缓存为空（拉取失败）时放行。
 // 缓存过期（Peek=nil）时触发后台刷新——否则聊天路径上预检过期后永久失效。
@@ -277,7 +305,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	opts, err := openAIToRunOptions(&req, s.mapModel(req.Model), s.cfg.CursorMode)
+	opts, err := openAIToRunOptions(&req, s.applyEffort(s.mapModel(req.Model), req.ReasoningEffort), s.cfg.CursorMode)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
